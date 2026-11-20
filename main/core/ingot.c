@@ -361,7 +361,7 @@ void ingot_gen_front(uint8_t *buf, uint32_t base_seed, const mint_rec_t *mr, ing
         for (int x = 0; x < SCR_W; x++, i++) {
             int b = ingot_base_h(x, y, base_seed, 0);
             if (!b) { buf[i] = 0; continue; }
-            float h = (float)b;
+            float h = (float)IG_SHADE(b);          /* height only: bit 7 is the recess flag */
             float dx = x + 0.5f - rcx, dy = y + 0.5f - rcy;
             float r2 = dx * dx + dy * dy;
             if (r2 < 27.0f * 27.0f) h += 9 * (1 - r2 / (27.0f * 27.0f));
@@ -370,7 +370,7 @@ void ingot_gen_front(uint8_t *buf, uint32_t base_seed, const mint_rec_t *mr, ing
             int v = (int)(h + 0.5f);
             if (v < 1) v = 1;
             if (v > 127) v = 127;
-            buf[i] = (uint8_t)(v | (a > 0.42f ? IG_RECESS : 0));
+            buf[i] = (uint8_t)(v | ((a > 0.42f || (b & IG_RECESS)) ? IG_RECESS : 0));
         }
 
     ingot_front_layout(lay, false);
@@ -607,6 +607,10 @@ void ingot_ink_zone(uint8_t *ink, const char *line1, const char *line2)
     const int cx = SCR_W / 2;
     if (line1 && line1[0])
         text_walk(&font_caps26, line1, cx - text_width(&font_caps26, line1, 1.0f) / 2.0f, ZONE_PRICE_BASE, 1.0f, 0, SCR_H, zink_px, &c);
-    if (line2 && line2[0])
-        text_walk(&font_caps11, line2, cx - text_width(&font_caps11, line2, 1.4f) / 2.0f, ZONE_GOLD_BASE, 1.4f, 0, SCR_H, zink_px, &c);
+    if (line2 && line2[0]) {
+        /* keep clear of the engraved frame (x 19..151): tighten the tracking if needed */
+        float tr = 1.4f;
+        while (tr > -0.4f && text_width(&font_caps11, line2, tr) > 116) tr -= 0.2f;
+        text_walk(&font_caps11, line2, cx - text_width(&font_caps11, line2, tr) / 2.0f, ZONE_GOLD_BASE, tr, 0, SCR_H, zink_px, &c);
+    }
 }
