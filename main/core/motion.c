@@ -3,8 +3,8 @@
 #include <string.h>
 
 #define SHAKE_SWINGS 2          /* back and forth */
-#define SWING_GAP_US 450000     /* max time between swings */
-#define NORM_DEV_MIN 0.35f      /* a swing must push |a| this far from 1 g */
+#define SWING_GAP_US 600000     /* max time between swings */
+#define NORM_DEV_MIN 0.34f      /* somewhere in the swing, |a| must leave 1 g by this much */
 
 void motion_init(motion_t *m)
 {
@@ -41,17 +41,32 @@ void motion_step(motion_t *m, const float a[3], const float *w, float dt, int64_
 
     bool ev = false;
     if (now_us - m->last_peak_us > SWING_GAP_US) m->count = 0;
-    if (m->armed && mag > thr && fabsf(an - 1) > NORM_DEV_MIN) {
-        m->armed = false;
-        float dir[3] = { lin[0] / mag, lin[1] / mag, lin[2] / mag };
-        float dot = dir[0] * m->last_dir[0] + dir[1] * m->last_dir[1] + dir[2] * m->last_dir[2];
-        if (m->count > 0 && dot < -0.3f) m->count++;
-        else m->count = 1;
-        memcpy(m->last_dir, dir, sizeof dir);
-        m->last_peak_us = now_us;
-        if (m->count >= SHAKE_SWINGS) { ev = true; m->count = 0; m->last_peak_us = 0; }
-    } else if (!m->armed && mag < thr * 0.45f) {
-        m->armed = true;
+    if (m->armed) {
+        if (mag > thr) {                      /* a swing begins */
+            m->armed = false;
+            m->sw_mag = 0;
+            m->sw_dev = 0;
+        }
+    }
+    if (!m->armed) {
+        /* follow the swing to its peak: direction at the peak, largest departure from 1 g */
+        if (mag > m->sw_mag) {
+            m->sw_mag = mag;
+            for (int i = 0; i < 3; i++) m->sw_dir[i] = lin[i] / mag;
+        }
+        float dev = fabsf(an - 1);
+        if (dev > m->sw_dev) m->sw_dev = dev;
+        if (mag < thr * 0.45f) {              /* the swing is over: judge it as a whole */
+            m->armed = true;
+            if (m->sw_dev >= NORM_DEV_MIN) {
+                float dot = m->sw_dir[0] * m->last_dir[0] + m->sw_dir[1] * m->last_dir[1] + m->sw_dir[2] * m->last_dir[2];
+                if (m->count > 0 && dot < -0.3f) m->count++;
+                else m->count = 1;
+                memcpy(m->last_dir, m->sw_dir, sizeof m->sw_dir);
+                m->last_peak_us = now_us;
+                if (m->count >= SHAKE_SWINGS) { ev = true; m->count = 0; m->last_peak_us = 0; }
+            }
+        }
     }
     float gn = sqrtf(m->g[0] * m->g[0] + m->g[1] * m->g[1] + m->g[2] * m->g[2]);
     if (gn < 0.2f) gn = 1;

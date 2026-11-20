@@ -19,6 +19,8 @@ typedef struct {
     float last_dir[3];
     int count;
     bool armed;
+    /* the swing in progress (between crossing the threshold and falling back) */
+    float sw_mag, sw_dev, sw_dir[3];
 } motion_t;
 
 typedef struct {

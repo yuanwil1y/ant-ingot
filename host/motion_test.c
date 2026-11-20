@@ -67,7 +67,7 @@ static int run(const char *name, traj_fn f, float T, int use_gyro)
         }
         float w[3] = { W[2][1] + noise() * 5, W[0][2] + noise() * 5, W[1][0] + noise() * 5 };
         motion_out_t o;
-        motion_step(&m, a, use_gyro ? w : NULL, dt, (int64_t)(t * 1e6), 1.1f, &o);
+        motion_step(&m, a, use_gyro ? w : NULL, dt, (int64_t)(t * 1e6), 0.9f, &o);
         if (o.shake) shakes++;
         olds += old_step(&od, a, (long long)(t * 1e6));
     }
@@ -140,6 +140,14 @@ static void peek(float t, float e[3], float lw[3])
     lw[0] = 0.3f * sinf(3.14159f * fminf(1, u / 0.3f)); lw[1] = 0; lw[2] = 0;
 }
 
+/* a lazy shake: slower and softer, what people do when half-paying attention */
+static void lazy_shake(float t, float e[3], float lw[3])
+{
+    e[0] = -60 * DEG + 6 * DEG * sinf(t * 16); e[1] = 0; e[2] = 0;
+    float on = t > 0.3f && t < 1.5f ? 1 : 0;
+    lw[0] = on * 1.15f * sinf(2 * 3.14159f * 2.8f * t); lw[1] = 0; lw[2] = on * 0.2f * sinf(2 * 3.14159f * 2.8f * t);
+}
+
 int main(void)
 {
     int bad = 0;
@@ -151,6 +159,7 @@ int main(void)
         bad += run("quick peek at the back (x4)", peek, 4.8f, g) != 0;
         bad += run("hard shake (0.8 s)", shake, 1.6f, g) == 0;
         bad += run("gentle shake (1 s)", soft_shake, 1.8f, g) == 0;
+        bad += run("lazy shake (2.8 Hz, 1.15 g)", lazy_shake, 1.8f, g) == 0;
     }
     printf(bad ? "FAIL (%d)\n" : "all good\n", bad);
     return bad;

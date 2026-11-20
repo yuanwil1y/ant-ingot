@@ -42,9 +42,10 @@ int main(int argc, char **argv)
     bool market = !strcmp(script, "market");
     bool tilt = !strcmp(script, "tilt");
     bool assay = !strcmp(script, "assay");
-    bool heal = !strcmp(script, "heal");     /* the v0.4.6 bug: boot before the clock is set */
-    bool minted_start = !strcmp(script, "faces") || market || tilt || assay || heal;
-    if (market || tilt || assay || heal) {
+    bool heal = !strcmp(script, "heal");
+    bool flipcount = !strcmp(script, "flipcount");     /* the v0.4.6 bug: boot before the clock is set */
+    bool minted_start = !strcmp(script, "faces") || market || tilt || assay || heal || flipcount;
+    if (market || tilt || assay || heal || flipcount) {
         M.setup.pending.price = 88.00; M.setup.pending.buy_ts = 1795185000;
         snprintf(M.setup.pending.inscription, sizeof M.setup.pending.inscription, "FOR THE LONG RUN.");
         M.now = 1795185000 + 13200;
@@ -71,7 +72,7 @@ int main(int argc, char **argv)
     const float dt = 1.0f / 30;
     float t = 0;
     int nframes = 0;
-    float end = heal ? 10 : assay ? 12 : (tilt ? 14 : (market ? 16 : (minted_start ? 30 : 46)));
+    float end = flipcount ? 9 : heal ? 10 : assay ? 12 : (tilt ? 14 : (market ? 16 : (minted_start ? 30 : 46)));
     while (t < end) {
         input_t in = { 0 };
         if (!minted_start) {
@@ -85,6 +86,25 @@ int main(int argc, char **argv)
             if (t >= 5.5f && M.setup.stage != SETUP_READY && !M.mint.minted) M.setup.stage = SETUP_READY;
             /* shaking from 7.5s for ~2s, with a pause in the middle */
             if (t > 7.5f && t < 10.2f && !(t > 8.4f && t < 8.8f)) in.shake_energy = 1.4f + 0.4f * sinf(t * 9);
+        }
+        if (flipcount) {
+            /* 0.5-2.0 s: one long hard shake (detector fires every ~0.2 s). 2.0-3.5 s: still.
+               3.5-4.0 s: a short shake. 4.0-6 s: still. 6.0-6.3 s: shake again. */
+            bool shaking = (t > 0.5f && t < 2.0f) || (t > 3.5f && t < 4.0f) || (t > 6.0f && t < 6.3f);
+            in.shake_energy = shaking ? 1.8f : 0.05f;
+            static float next = 0;
+            if (shaking && t >= next) { in.shake = 1; next = t + 0.2f; }
+            static int last_face = -1, flips = 0;
+            scene_tick(dt, &in);
+            scene_take_events();
+            frame(stdout, scale);
+            extern int scene_debug_face(void);
+            int f = scene_debug_face();
+            if (f < 0) { t += dt; continue; }
+            if (last_face >= 0 && f != last_face) { flips++; fprintf(stderr, "t=%.2f landed on %s (flip %d)\n", t, f ? "back" : "front", flips); }
+            last_face = f;
+            t += dt;
+            continue;
         }
         if (heal) {
             /* 0-3 s: no clock yet, intraday quote (must NOT weigh). 3-6 s: clock set, market open.

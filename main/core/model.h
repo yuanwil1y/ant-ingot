@@ -106,7 +106,7 @@ typedef struct {
 static inline tune_t tune_defaults(void)
 {
     tune_t t = {
-        .shake_g = 1.1f, .shake_cooldown_ms = 550,
+        .shake_g = 0.9f, .shake_cooldown_ms = 350,
         .heat_floor = 0.25f, .heat_gain = 0.85f, .heat_decay = 0.45f,
         .flip_ms = 420, .flip_bounce = 0.10f,
         .mint_speed = 1.0f, .burin_ms = 38,

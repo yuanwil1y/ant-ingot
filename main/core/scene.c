@@ -89,6 +89,9 @@ static struct {
     bool flipping;
     float flip_t, fth, fvel;
     float cooldown;
+    float shake_pending;        /* a shake that arrived while busy, honoured for a moment */
+    bool burst_lock;            /* one continuous shake = one flip */
+    float burst_quiet;
     bool need_calm;
     float calm_t;
 
@@ -1974,10 +1977,20 @@ void scene_tick(float dt, const input_t *in)
             S.calm_t = in->shake_energy < tu->heat_floor ? S.calm_t + dt : 0;
             if (S.calm_t > 0.35f) S.need_calm = false;
         }
+        /* a shake that lands mid-flip or in the cooldown is kept for 0.6 s rather than dropped */
+        if (S.burst_lock) {
+            S.burst_quiet = in->shake_energy < tu->heat_floor ? S.burst_quiet + dt : 0;
+            if (S.burst_quiet > 0.12f) S.burst_lock = false;
+        }
+        if ((in->shake && !S.need_calm && !S.burst_lock) || in->btn_short) S.shake_pending = 0.6f;
+        else if (S.shake_pending > 0) S.shake_pending -= dt;
         if (S.flipping) {
             S.flip_t += dt;
             if (flip_step(dt) || S.flip_t * 1000 > tu->flip_ms * 2.5f) land_on(S.face_to);
-        } else if ((in->btn_short || (in->shake && !S.need_calm)) && S.cooldown <= 0 && S.as_phase != 2) {
+        } else if (S.shake_pending > 0 && S.cooldown <= 0 && S.as_phase != 2) {
+            S.shake_pending = 0;
+            S.burst_lock = true;
+            S.burst_quiet = 0;
             start_flip();
         }
         zone_tick(dt);
@@ -2112,3 +2125,6 @@ void scene_dirty_rows(int *y0, int *y1)
     if (S.partial) { *y0 = ZONE_Y0 - 2; *y1 = ZONE_Y1 + 3; }
     else { *y0 = 0; *y1 = SCR_H; }
 }
+
+/* for the host simulator's tests */
+int scene_debug_face(void) { return S.flipping ? -1 : S.face; }
