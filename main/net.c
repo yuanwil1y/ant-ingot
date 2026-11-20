@@ -716,6 +716,7 @@ static esp_err_t h_state(httpd_req_t *r)
     cJSON *mo = cJSON_AddObjectToObject(j, "motion");
     cJSON_AddNumberToObject(mo, "peak", peak);
     cJSON_AddNumberToObject(mo, "shakes", shakes);
+    cJSON_AddNumberToObject(mo, "rest", hw_imu_rest_reading());
     return send_json(r, j);
 }
 

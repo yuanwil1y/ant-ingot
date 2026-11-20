@@ -168,12 +168,15 @@ static float s_thresh = 1.1f;
 static volatile float s_meter_peak;
 static volatile int64_t s_meter_t;
 static volatile uint32_t s_meter_count;
+static volatile float s_rest_raw = 0;   /* |a| at rest in assumed (+-8 g) units; ~1.0 when the range is right */
 
 void hw_shake_meter(float *peak, uint32_t *count)
 {
     *peak = s_meter_peak;
     *count = s_meter_count;
 }
+
+float hw_imu_rest_reading(void) { return s_rest_raw; }
 
 static esp_err_t reg_write(i2c_master_dev_handle_t d, uint8_t r, uint8_t v)
 {
@@ -197,11 +200,20 @@ static bool imu_init(void)
         reg_read(s_imu, 0x00, &who, 1);
         ESP_LOGI(TAG, "QMI8658 at 0x%02x, whoami 0x%02x", addrs[i], who);
         reg_write(s_imu, 0x60, 0xB0);         /* soft reset */
-        vTaskDelay(pdMS_TO_TICKS(20));
-        reg_write(s_imu, 0x02, 0x40);         /* CTRL1: auto-increment, little endian */
-        reg_write(s_imu, 0x03, 0x25);         /* CTRL2: accel +-8g, ~250 Hz */
-        reg_write(s_imu, 0x06, 0x00);         /* CTRL5: no LPF tweaks */
-        reg_write(s_imu, 0x08, 0x01);         /* CTRL7: accel only */
+        vTaskDelay(pdMS_TO_TICKS(60));        /* give it time to come back before configuring */
+        uint8_t c2 = 0, c7 = 0;
+        for (int t = 0; t < 5; t++) {
+            reg_write(s_imu, 0x02, 0x40);     /* CTRL1: auto-increment, little endian */
+            reg_write(s_imu, 0x03, 0x25);     /* CTRL2: accel +-8g, ~250 Hz */
+            reg_write(s_imu, 0x06, 0x00);     /* CTRL5: no LPF tweaks */
+            reg_write(s_imu, 0x08, 0x01);     /* CTRL7: accel only */
+            vTaskDelay(pdMS_TO_TICKS(10));
+            reg_read(s_imu, 0x03, &c2, 1);
+            reg_read(s_imu, 0x08, &c7, 1);
+            if (c2 == 0x25 && (c7 & 0x01)) break;
+            vTaskDelay(pdMS_TO_TICKS(30));
+        }
+        ESP_LOGI(TAG, "QMI8658 CTRL2=0x%02x (want 0x25) CTRL7=0x%02x", c2, c7);
         return true;
     }
     ESP_LOGW(TAG, "IMU not found");
@@ -212,6 +224,10 @@ static void input_task(void *arg)
 {
     motion_t mo;
     motion_init(&mo);
+    /* scale self-calibration: whatever range the chip really runs at, a bar at rest reads 1 g */
+    float corr = 1.0f, wsum = 0, wsq = 0;
+    int wn = 0;
+    bool calibrated = false;
     int64_t btn_down = 0;
     bool btn_prev = false, long_sent = false;
     int tick = 0;
@@ -223,8 +239,25 @@ static void input_task(void *arg)
         if (s_imu) {
             uint8_t b[6];
             if (reg_read(s_imu, 0x35, b, 6) == ESP_OK) {
-                float a[3];
-                for (int i = 0; i < 3; i++) a[i] = (int16_t)(b[2 * i] | (b[2 * i + 1] << 8)) / 4096.0f;
+                float a[3], raw2 = 0;
+                for (int i = 0; i < 3; i++) {
+                    a[i] = (int16_t)(b[2 * i] | (b[2 * i + 1] << 8)) / 4096.0f;
+                    raw2 += a[i] * a[i];
+                }
+                float rn = sqrtf(raw2);
+                wsum += rn; wsq += rn * rn; wn++;
+                if (wn == 100) {                                    /* 0.5 s window */
+                    float mean = wsum / wn, var = wsq / wn - mean * mean;
+                    if (mean > 0.15f && mean < 10 && var < (0.02f * mean) * (0.02f * mean)) {
+                        s_rest_raw = calibrated ? s_rest_raw + (mean - s_rest_raw) * 0.3f : mean;
+                        if (!calibrated) ESP_LOGI(TAG, "at rest |a| reads %.3f (1.000 expected), correcting", mean);
+                        calibrated = true;
+                        corr = 1.0f / s_rest_raw;
+                    }
+                    wsum = wsq = 0;
+                    wn = 0;
+                }
+                for (int i = 0; i < 3; i++) a[i] *= corr;
                 motion_out_t o;
                 motion_step(&mo, a, NULL, dt, now, s_thresh, &o);
                 /* shake meter: strongest swing in the last 3 s, and how many shakes were seen */

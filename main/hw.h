@@ -26,6 +26,7 @@ typedef struct {
 } hw_input_t;
 void hw_inputs_take(hw_input_t *out, const tune_t *tune);
 void hw_shake_meter(float *peak_g, uint32_t *shakes);   /* strongest swing in the last 3 s */
+float hw_imu_rest_reading(void);                        /* |a| at rest before correction; 1.0 = range as configured */
 
 void hw_led_init(void);
 void hw_led_set(uint8_t r, uint8_t g, uint8_t b);
