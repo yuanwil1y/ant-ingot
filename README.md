@@ -6,11 +6,14 @@ Waveshare ESP32-C6-Touch-LCD-1.9 上的纪念金条。底座取自官方 `08_Fac
 
 ```bash
 pip install esptool
-# 第一次烧录，或想“重铸”（清空已铸造的数据）时，先整片擦除：
+# 全新安装，或者想“重铸”（清空已铸造的数据）：
 esptool.py --chip esp32c6 erase_flash
 esptool.py --chip esp32c6 -b 460800 write_flash 0x0 ant-ingot-merged.bin
+
+# 升级并保留已铸造的金条：只写应用分区（Release 里的 ant_ingot.bin）
+esptool.py --chip esp32c6 -b 460800 write_flash 0x10000 ant_ingot.bin
 ```
-只覆盖固件、不擦除的话，铸造记录（存在 NVS 里）会保留。
+注意：合并镜像从 0x0 开始连续写入，中间会覆盖存放铸造记录的 NVS 区域。所以升级时只能用 `ant_ingot.bin`。
 
 ## 使用流程
 1. 开机后屏幕上是一块毛坯锭，用手机扫卡片上的二维码，连上 Wi-Fi `A Share of Anthropic Setup`，配置页会自动弹出（没弹出就打开 192.168.4.1）。
