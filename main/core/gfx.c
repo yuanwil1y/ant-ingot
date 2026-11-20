@@ -97,6 +97,12 @@ void fill_rrect(strip_t *st, float x0, float y0, float x1, float y1, float r, ui
         uint16_t *o = &st->px[(y - st->y0) * SCR_W];
         int full = (int)(vcov * alpha);
         for (int x = ia; x < ib; x++) {
+            if (x > xa && x + 1 < xb) {                 /* interior: no float math */
+                int lim = (int)xb - 1;
+                if (lim > ib) lim = ib;
+                for (; x < lim; x++) o[x] = full >= 256 ? c : blend565(o[x], c, full);
+                if (x >= ib) break;
+            }
             float hc = fminf(x + 1 - xa, xb - x);
             int a = hc >= 1 ? full : (int)(clampf(hc, 0, 1) * full);
             o[x] = blend565(o[x], c, a);

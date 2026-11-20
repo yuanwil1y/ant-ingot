@@ -1128,28 +1128,70 @@ static void row_lr(strip_t *st, int y, const char *l, const char *r, uint16_t rc
     text_draw(st, &font_mono11, r, 145 - text_width(&font_mono11, r, 0), y, 0, rc, a);
 }
 
-static void render_enamel(strip_t *st)
+/* The enamel window's outline is fixed: work it out once (per row: where the window
+ * starts and ends, the anti-aliasing of its two edge pixels, and its colour). */
+static struct {
+    bool ok;
+    int16_t xa[SCR_H], xb[SCR_H];       /* first/last pixel touched by the window, -1 = none */
+    uint8_t al[SCR_H], ar[SCR_H];       /* coverage of those two edge pixels, 0..255 */
+    uint16_t col[SCR_H];
+    uint8_t vcov[SCR_H];
+} EN;
+
+static void enamel_prepare(void)
 {
-    if (S.base) render_metal(st, S.base, S.lut_back, false);
     const float X0 = PANEL_X0, X1 = PANEL_X1, Y0 = PANEL_Y0, Y1 = PANEL_Y1, R = 9;
-    for (int yy = 0; yy < st->h; yy++) {
-        int y = st->y0 + yy;
+    for (int y = 0; y < SCR_H; y++) {
         float fy = y + 0.5f;
+        EN.xa[y] = EN.xb[y] = -1;
         if (fy < Y0 - 1 || fy > Y1 + 1) continue;
         float inset = 0;
         if (fy < Y0 + R) { float d = Y0 + R - fy; inset = R - sqrtf(fmaxf(0, R * R - d * d)); }
         else if (fy > Y1 - R) { float d = fy - (Y1 - R); inset = R - sqrtf(fmaxf(0, R * R - d * d)); }
         float xa = X0 + inset, xb = X1 - inset;
         float vcov = clampf(fminf(fy - Y0, Y1 - fy) + 0.5f, 0, 1);
+        if (vcov <= 0) continue;
+        int ia = (int)floorf(xa), ib = (int)floorf(xb);
+        EN.xa[y] = (int16_t)ia;
+        EN.xb[y] = (int16_t)ib;
+        EN.al[y] = (uint8_t)(255 * clampf(ia + 1 - xa, 0, 1));
+        EN.ar[y] = (uint8_t)(255 * clampf(xb - ib, 0, 1));
+        EN.vcov[y] = (uint8_t)(255 * vcov);
         float t = (y - Y0) / (Y1 - Y0);
         int base = (int)(14 + 8 * (1 - t));
         if (y < Y0 + 5) base -= (int)((Y0 + 5 - y) * 2);
-        uint16_t ec = rgb565(base, base - 1, base + 1);
+        EN.col[y] = rgb565(base, base - 1, base + 1);
+    }
+    EN.ok = true;
+}
+
+/* Only the metal rim is drawn from the surface; the window is a flat fill. */
+static void render_enamel(strip_t *st)
+{
+    if (!EN.ok) enamel_prepare();
+    const uint16_t *lut = S.lut_back;
+    for (int yy = 0; yy < st->h; yy++) {
+        int y = st->y0 + yy;
         uint16_t *o = &st->px[yy * SCR_W];
-        for (int x = (int)xa; x <= (int)xb && x < SCR_W; x++) {
-            float cov = vcov * clampf(fminf(x + 1 - xa, xb - x), 0, 1);
-            o[x] = blend565(o[x], ec, (int)(cov * 256));
+        const uint8_t *row = S.base ? S.base + y * SCR_W : NULL;
+        int xa = EN.xa[y], xb = EN.xb[y];
+        bool full = EN.vcov[y] == 255 && xa >= 0;
+        int m0 = full ? xa + 1 : SCR_W, m1 = full ? xb : 0;   /* metal outside [m0, m1) */
+        for (int x = 0; x < SCR_W; x++) {
+            if (x == m0) { x = m1 - 1; continue; }
+            int idx = row ? row[x] : 0;
+            o[x] = idx ? lut[idx] : S.bg_row[y];
         }
+        if (xa < 0) continue;
+        uint16_t ec = EN.col[y];
+        int v = EN.vcov[y];
+        if (full) {
+            for (int x = xa + 1; x < xb; x++) o[x] = ec;
+        } else {
+            for (int x = xa + 1; x < xb; x++) o[x] = blend565(o[x], ec, v + 1);
+        }
+        if (xa >= 0 && xa < SCR_W) o[xa] = blend565(o[xa], ec, (EN.al[y] * v >> 8) + 1);
+        if (xb >= 0 && xb < SCR_W) o[xb] = blend565(o[xb], ec, (EN.ar[y] * v >> 8) + 1);
     }
 }
 
@@ -1163,13 +1205,17 @@ static void hairline_d(strip_t *st, int y, int a)
     draw_seg(st, 82.5f, y, 85, y - 2.5f, 1.2f, C_GOLD_DIM, a);
 }
 
-typedef struct { strip_t *st; int first; float pos; int a; } qdctx_t;
+typedef struct { strip_t *st; int first; float pos; int a; int last_ci; int al; } qdctx_t;
 static void q_px(void *vc, int x, int y, int a15, int ci)
 {
     qdctx_t *c = vc;
     if (x < 0 || x >= SCR_W) return;
-    float r = clampf((c->pos - (c->first + ci)) / 2.5f, 0, 1);     /* each letter fades in over ~2.5 letters */
-    int al = (int)(r * c->a);
+    if (ci != c->last_ci) {         /* each letter fades in over ~2.5 letters; worked out once per letter */
+        float r = clampf((c->pos - (c->first + ci)) / 2.5f, 0, 1);
+        c->al = (int)(r * c->a);
+        c->last_ci = ci;
+    }
+    int al = c->al;
     if (!al) return;
     uint16_t *d = &c->st->px[(y - c->st->y0) * SCR_W + x];
     *d = blend565(*d, C_GOLD_HI, a15 * al / 15);
@@ -1189,7 +1235,7 @@ static void page_line(strip_t *st, int a, int yo)
     for (int i = 0; i < S.nql; i++) {
         int base = S.ql[i].y + yo;
         if (base - 20 > st->y0 + st->h || base + 8 < st->y0) continue;
-        qdctx_t c = { st, S.ql[i].first, pos, a };
+        qdctx_t c = { st, S.ql[i].first, pos, a, -1, 0 };
         text_walk(&font_ital17, S.ql[i].s, S.ql[i].x, base, 0.2f, st->y0, st->y0 + st->h, q_px, &c);
     }
     if (S.burin && S.burin_pos < S.nchars) {
