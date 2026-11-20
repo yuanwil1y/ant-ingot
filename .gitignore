@@ -1,0 +1,7 @@
+build/
+managed_components/
+dependencies.lock
+sdkconfig.old
+host/sim
+host/*.mp4
+*.bin

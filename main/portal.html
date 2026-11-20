@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>A Share of Anthropic</title>
+<style>
+:root{--paper:#f3ecdc;--ink:#2e2416;--dim:#8a7a5c;--gold:#a8802f;--rule:#c9b48a;--bad:#9b3523;--ok:#3e7a3e}
+*{box-sizing:border-box}
+body{margin:0;background:#1b1610;font:16px/1.45 Georgia,"Times New Roman",serif;color:var(--ink)}
+.cert{max-width:440px;margin:14px auto;background:var(--paper);padding:22px 20px 26px;border:1px solid var(--rule);
+ outline:6px double var(--gold);outline-offset:-14px;border-radius:4px}
+h1{font-size:15px;letter-spacing:.32em;text-align:center;margin:10px 0 2px;font-weight:normal}
+.sub{text-align:center;color:var(--dim);font-size:13px;letter-spacing:.12em;margin-bottom:18px}
+h2{font-size:12px;letter-spacing:.28em;color:var(--gold);font-weight:normal;margin:22px 0 8px;text-align:center}
+h2:before,h2:after{content:"";display:inline-block;width:42px;border-top:1px solid var(--rule);vertical-align:middle;margin:0 10px}
+label{display:block;font-size:13px;color:var(--dim);margin:12px 0 4px}
+input,select{width:100%;padding:10px;border:1px solid var(--rule);background:#fbf7ee;border-radius:3px;font:16px Georgia,serif;color:var(--ink)}
+input[type=range]{padding:0;border:0;background:none;accent-color:var(--gold)}
+.row{display:flex;gap:10px}.row>div{flex:1}
+button{width:100%;margin-top:18px;padding:13px;border:0;border-radius:3px;background:var(--ink);color:var(--paper);
+ font:14px Georgia,serif;letter-spacing:.24em}
+button.ghost{background:none;color:var(--ink);border:1px solid var(--rule);letter-spacing:.12em}
+.note{font-size:13px;color:var(--dim);margin-top:6px}
+.chk{list-style:none;padding:0;margin:8px 0}.chk li{padding:6px 0;display:flex;gap:10px;align-items:center}
+.dot{width:18px;text-align:center}.ok{color:var(--ok)}.bad{color:var(--bad)}
+.err{color:var(--bad);text-align:center;margin-top:10px}
+.big{font-size:20px;text-align:center;margin:16px 0}
+.t{display:flex;justify-content:space-between;font-size:13px;color:var(--dim)}.t b{color:var(--ink);font-weight:normal}
+.hide{display:none}
+.mono{font-family:ui-monospace,Menlo,monospace;font-size:13px}
+</style>
+</head>
+<body>
+<div class="cert">
+ <h1>CERTIFICATE OF MINTING</h1>
+ <div class="sub">A SHARE OF ANTHROPIC &middot; NASDAQ: ANT</div>
+
+ <!-- ===== setup (before minting) ===== -->
+ <div id="setup" class="hide">
+  <h2>NETWORK</h2>
+  <label>Wi-Fi network</label>
+  <select id="ssidSel"><option value="">Scanning…</option></select>
+  <input id="ssid" class="hide" placeholder="Network name">
+  <label>Password</label>
+  <input id="pass" type="password" autocomplete="off">
+
+  <h2>THE PURCHASE</h2>
+  <div class="row">
+   <div><label>Price per share (USD)</label><input id="price" type="number" step="0.01" min="0" inputmode="decimal" placeholder="97.17"></div>
+   <div style="flex:.55"><label>Shares</label><input id="shares" type="number" min="1" value="1"></div>
+  </div>
+  <label>Filled at (Beijing time)</label>
+  <input id="time" type="datetime-local">
+  <label>Inscription (optional)</label>
+  <input id="ins" maxlength="24" placeholder="e.g. FOR THE LONG RUN">
+  <div class="note">Engraved forever once minted.</div>
+
+  <h2>DEEPSEEK</h2>
+  <label>API key</label>
+  <input id="key" type="password" autocomplete="off" placeholder="sk-…">
+  <div class="note">Used once a day to write the line on the back.</div>
+
+  <button id="go">CHECK &amp; PREPARE</button>
+  <div id="formErr" class="err"></div>
+ </div>
+
+ <!-- ===== checking / ready ===== -->
+ <div id="progress" class="hide">
+  <h2>CHECKING</h2>
+  <ul class="chk">
+   <li><span class="dot" id="c0">·</span>Wi-Fi</li>
+   <li><span class="dot" id="c1">·</span>Market data</li>
+   <li><span class="dot" id="c2">·</span>DeepSeek</li>
+  </ul>
+  <div id="checkErr" class="err"></div>
+  <button id="back" class="ghost hide">EDIT DETAILS</button>
+  <div id="ready" class="hide">
+   <div class="big">Now shake the bar to mint it.</div>
+   <div class="note" style="text-align:center">Keep shaking until it glows white. To change anything first, tap Edit.</div>
+   <button id="edit" class="ghost">EDIT DETAILS</button>
+  </div>
+ </div>
+
+ <!-- ===== settings (after minting) ===== -->
+ <div id="settings" class="hide">
+  <div class="big" id="minted">Minted.</div>
+  <div class="t"><span>Price</span><b id="sPrice"></b></div>
+  <div class="t"><span>Filled</span><b id="sTime"></b></div>
+  <div class="t"><span>Days held</span><b id="sDay"></b></div>
+
+  <h2>FEEL</h2>
+  <div id="sliders"></div>
+  <div class="row"><div><button class="ghost" id="rehearse">REHEARSE MINT</button></div><div><button class="ghost" id="reset">DEFAULTS</button></div></div>
+  <button id="saveFeel">SAVE FEEL</button>
+  <div class="note" id="feelNote" style="text-align:center"></div>
+
+  <h2>NETWORK &amp; KEY</h2>
+  <label>Wi-Fi network</label>
+  <select id="ssidSel2"><option value="">Scanning…</option></select>
+  <input id="ssid2" class="hide" placeholder="Network name">
+  <label>Password (leave empty to keep)</label>
+  <input id="pass2" type="password" autocomplete="off">
+  <label>DeepSeek key (leave empty to keep)</label>
+  <input id="key2" type="password" autocomplete="off">
+  <button class="ghost" id="saveNet">SAVE &amp; RECONNECT</button>
+  <div class="note" id="netNote" style="text-align:center"></div>
+
+  <button id="done">DONE</button>
+ </div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const api=(p,b)=>fetch(p,b?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}:{}).then(r=>r.json());
+let S={},mode='',editing=false;
+
+function fillScan(sel,inp,cur){
+  api('/api/scan').then(list=>{
+    sel.innerHTML='';
+    list.sort((a,b)=>b.rssi-a.rssi).forEach(n=>{const o=document.createElement('option');o.value=o.textContent=n.ssid;sel.appendChild(o)});
+    const o=document.createElement('option');o.value='__other';o.textContent='Other…';sel.appendChild(o);
+    if(cur){if(![...sel.options].some(x=>x.value===cur)){const c=document.createElement('option');c.value=c.textContent=cur;sel.prepend(c)}sel.value=cur}
+  }).catch(()=>{sel.innerHTML='<option value="__other">Type it in</option>';inp.classList.remove('hide')});
+  sel.onchange=()=>inp.classList.toggle('hide',sel.value!=='__other');
+}
+const ssidOf=(sel,inp)=>sel.value==='__other'?inp.value:sel.value;
+
+function pad(n){return String(n).padStart(2,'0')}
+function bj(ts){const d=new Date((ts+8*3600)*1000);return d.getUTCFullYear()+'-'+pad(d.getUTCMonth()+1)+'-'+pad(d.getUTCDate())+' '+pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())}
+
+function show(m){mode=m;['setup','progress','settings'].forEach(x=>$(x).classList.toggle('hide',x!==m))}
+
+function render(){
+  if(S.minted){ if(mode!=='settings'){show('settings');initSettings()} updateSettings(); return }
+  if(editing){ if(mode!=='setup'){show('setup');initSetup()} return }
+  if(S.stage===0){ if(mode!=='setup'){show('setup');initSetup()} return }
+  show('progress');
+  const sym=['·','…','✓','✕'];
+  S.chk.forEach((c,i)=>{const e=$('c'+i);e.textContent=sym[c];e.className='dot '+(c===2?'ok':c===3?'bad':'')});
+  $('checkErr').textContent=S.stage===2?S.error:'';
+  $('back').classList.toggle('hide',S.stage!==2);
+  $('ready').classList.toggle('hide',S.stage!==3);
+}
+
+function initSetup(){
+  fillScan($('ssidSel'),$('ssid'),S.ssid);
+  const p=S.purchase||{};
+  if(p.price>0)$('price').value=p.price.toFixed(2);
+  if(p.shares)$('shares').value=p.shares;
+  if(p.buy_ts>0)$('time').value=bj(p.buy_ts).replace(' ','T');
+  if(p.inscription)$('ins').value=p.inscription;
+}
+$('go').onclick=()=>{
+  const body={ssid:ssidOf($('ssidSel'),$('ssid')),pass:$('pass').value,price:parseFloat($('price').value),
+    shares:parseInt($('shares').value||'1'),time:$('time').value,inscription:$('ins').value,key:$('key').value};
+  body.keep_pass=!body.pass&&body.ssid===S.ssid;
+  if(!body.ssid){$('formErr').textContent='Choose a Wi-Fi network.';return}
+  if(!(body.price>0)||!body.time){$('formErr').textContent='Enter the fill price and time.';return}
+  if(!body.key&&!S.has_key){$('formErr').textContent='Enter your DeepSeek API key.';return}
+  $('formErr').textContent='';editing=false;S.stage=1;S.chk=[1,0,0];render();
+  api('/api/setup',body).then(r=>{if(r.error){editing=true;show('');render();$('formErr').textContent=r.error}});
+};
+$('back').onclick=$('edit').onclick=()=>{editing=true;show('');render()};
+
+/* ---- settings ---- */
+const SL=[
+ ['shake_g','Shake threshold (g)',0.5,2.5,0.05],
+ ['shake_cooldown_ms','Pause between flips (ms)',150,1500,10],
+ ['flip_ms','Flip settle time (ms)',200,1200,10],
+ ['flip_bounce','Flip bounce',0,0.35,0.01],
+ ['heat_gain','Heating speed',0.2,2.5,0.05],
+ ['heat_decay','Cooling when you stop',0.05,1.5,0.05],
+ ['heat_floor','Shake ignored below (g)',0.05,1,0.05],
+ ['mint_speed','Mint animation speed',0.5,2,0.05],
+ ['burin_ms','Engraving per letter (ms)',10,120,1],
+ ['longpress_ms','Long press (ms)',300,1500,10],
+ ['zoom_ms','Zoom-out length (ms)',3000,15000,100],
+ ['brightness','Screen brightness',5,100,1],
+ ['led','LED brightness',0,100,1],
+ ['preview_days','Preview age (days, not saved)',-1,3650,1],
+];
+let tuneTimer=null,pending={};
+function initSettings(){
+  const box=$('sliders');box.innerHTML='';
+  SL.forEach(([k,lab,mn,mx,st])=>{
+    const w=document.createElement('div');
+    w.innerHTML=`<label>${lab} <span class="mono" id="v_${k}"></span></label><input type="range" id="r_${k}" min="${mn}" max="${mx}" step="${st}">`;
+    box.appendChild(w);
+    const r=w.querySelector('input');r.value=S.tune[k];$('v_'+k).textContent=S.tune[k];
+    r.oninput=()=>{const v=parseFloat(r.value);$('v_'+k).textContent=k==='preview_days'&&v<0?'real':v;pending[k]=v;
+      clearTimeout(tuneTimer);tuneTimer=setTimeout(()=>{api('/api/tune',pending);pending={}},60)};
+  });
+  fillScan($('ssidSel2'),$('ssid2'),S.ssid);
+}
+function updateSettings(){
+  const p=S.purchase;
+  $('sPrice').textContent='$'+p.price.toFixed(2)+(p.shares>1?' × '+p.shares:'');
+  $('sTime').textContent=bj(p.buy_ts)+' BJT';
+  $('sDay').textContent=S.day||'—';
+}
+$('saveFeel').onclick=()=>api('/api/tune',{save:true}).then(()=>{$('feelNote').textContent='Saved.'});
+$('reset').onclick=()=>api('/api/tune',{reset:true}).then(t=>{S.tune=t;initSettings();$('feelNote').textContent='Defaults restored (not saved yet).'});
+$('rehearse').onclick=()=>api('/api/rehearse',{}).then(()=>{$('feelNote').textContent='Shake the bar to rehearse. Nothing will be saved.'});
+$('saveNet').onclick=()=>{
+  const pass=$('pass2').value;
+  api('/api/setup',{ssid:ssidOf($('ssidSel2'),$('ssid2')),pass:pass,keep_pass:!pass,key:$('key2').value}).then(()=>{$('netNote').textContent='Reconnecting… checks run in the background.'});
+};
+$('done').onclick=()=>api('/api/exit',{}).then(()=>{document.body.innerHTML='<div class="cert"><div class="big">Settings closed.</div></div>'});
+
+function poll(){api('/api/state').then(s=>{S=s;render()}).catch(()=>{}).finally(()=>setTimeout(poll,mode==='progress'?700:3000))}
+poll();
+</script>
+</body>
+</html>
