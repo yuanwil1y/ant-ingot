@@ -17,7 +17,6 @@ static float vnoise1(float x, uint32_t seed)
     return a + (b - a) * f;
 }
 
-static float gauss(float x, float c, float w) { float d = (x - c) / w; return expf(-d * d); }
 
 /* signed distance to the bar outline (negative inside) and outward normal */
 static float bar_sdf(float x, float y, float *nx, float *ny)
@@ -37,35 +36,30 @@ static float bar_sdf(float x, float y, float *nx, float *ny)
 
 /* ------------------------------------------------------------------ base */
 
+#define PLATEAU 92
+#define GROOVE 20
+
+/* Height map of a blank bar: rounded bevel up to a flat plateau, with a fine
+ * sand texture (front) or horizontal brushing (back). Lighting happens at render time. */
 void ingot_gen_base(uint8_t *buf, uint32_t seed, int back)
 {
-    const float Lx = -0.55f, Ly = -0.83f;  /* light from upper left */
-    float ph = (seed & 0xFF) / 255.0f * 0.06f;
     for (int y = 0; y < SCR_H; y++) {
-        float streak = back ? (vnoise1(y * 0.9f, seed) - 0.5f) * 9 + (vnoise1(y * 3.1f, seed ^ 77) - 0.5f) * 4 : 0;
+        float streak = back ? (vnoise1(y * 0.9f, seed) - 0.5f) * 2.4f + (vnoise1(y * 3.1f, seed ^ 77) - 0.5f) * 1.6f : 0;
         for (int x = 0; x < SCR_W; x++) {
             float nx, ny;
             float d = -bar_sdf(x + 0.5f, y + 0.5f, &nx, &ny);   /* + inside */
             if (d < -0.5f) { buf[y * SCR_W + x] = 0; continue; }
             float cov = clampf(d + 0.5f, 0, 1);
-            /* broad studio reflections across the plateau */
-            float u = (x * 0.42f + y * 0.91f) / (SCR_W * 0.42f + SCR_H * 0.91f) + ph;
-            float refl = back
-                ? 54 + 30 * gauss(u, 0.30f, 0.16f) + 18 * gauss(u, 0.74f, 0.2f) + streak
-                : 44 + 50 * gauss(u, 0.24f, 0.11f) + 28 * gauss(u, 0.64f, 0.15f) + 12 * gauss(u, 0.95f, 0.08f);
-            refl += ((hash32(x * 7919 + y * 104729 + seed) & 255) / 255.0f - 0.5f) * (back ? 2.5f : 3.0f);
-            float s;
+            float h;
             if (d < BAR_BEVEL) {
-                float t = d / BAR_BEVEL;                     /* 0 at edge, 1 at plateau */
-                float slope = powf(1 - t, 0.7f);
-                float lit = -(nx * Lx + ny * Ly);
-                s = refl * (0.55f + 0.45f * t) + 58 * lit * slope + 8;
-                s += 22 * gauss(d, BAR_BEVEL - 0.6f, 0.9f);  /* crisp rim where bevel meets the face */
+                float t = d / BAR_BEVEL;
+                h = 16 + (PLATEAU - 16) * (1 - (1 - t) * (1 - t));    /* rounded shoulder */
             } else {
-                s = refl;
+                h = PLATEAU;
             }
-            s *= cov;
-            int v = (int)(s + 0.5f);
+            h += streak + ((hash32(x * 7919 + y * 104729 + seed) & 255) / 255.0f - 0.5f) * (back ? 0.8f : 1.1f);
+            h *= cov;
+            int v = (int)(h + 0.5f);
             if (v < 1) v = 1;
             if (v > 127) v = 127;
             buf[y * SCR_W + x] = (uint8_t)v;
@@ -336,25 +330,18 @@ void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *mr, in
         ink_text(ink, &font_caps11, ser, cx, 304, 1.6f);
     }
 
-    /* ---- combine ink with the base, bottom-right to top-left so (x-1,y-1) is still ink */
-    for (int y = SCR_H - 1; y >= 0; y--)
-        for (int x = SCR_W - 1; x >= 0; x--) {
-            int i = y * SCR_W + x;
+    /* ---- combine: grooves are cut into the base height; the cartouche is a low dome */
+    for (int i = 0, y = 0; y < SCR_H; y++)
+        for (int x = 0; x < SCR_W; x++, i++) {
             int b = base[i];
-            int k = ink[i];
             if (!b) { buf[i] = 0; continue; }
-            float s = (float)b;
+            float h = (float)b;
             float dx = x + 0.5f - rcx, dy = y + 0.5f - rcy;
             float r2 = dx * dx + dy * dy;
-            if (r2 < 27.0f * 27.0f) {          /* polished, slightly domed cartouche */
-                float r = sqrtf(r2) / 27.0f;
-                s = s * 0.55f + 40 + 26 * (1 - r * r) - 16 * (dx * 0.55f + dy * 0.83f) / 27.0f;
-            }
-            int ul = (x > 0 && y > 0) ? ink[i - SCR_W - 1] : 0;
-            float a = k / 255.0f;
-            s = s * (1 - 0.62f * a);
-            if (ul > k) s += (ul - k) / 255.0f * 30;   /* lit far wall of the groove */
-            int v = (int)(s + 0.5f);
+            if (r2 < 27.0f * 27.0f) h += 9 * (1 - r2 / (27.0f * 27.0f));
+            float a = ink[i] / 255.0f;
+            h -= GROOVE * a;
+            int v = (int)(h + 0.5f);
             if (v < 1) v = 1;
             if (v > 127) v = 127;
             buf[i] = (uint8_t)(v | (a > 0.42f ? IG_RECESS : 0));
@@ -391,8 +378,7 @@ static void eg_dark(void *c, int x, int y, int a, int ci)
     if ((unsigned)x >= SCR_W || (unsigned)y >= SCR_H) return;
     uint8_t *p = &buf[y * SCR_W + x];
     if (!*p) return;
-    float s = IG_SHADE(*p) * (1 - 0.62f * a / 15.0f);
-    int v = (int)(s + 0.5f);
+    int v = IG_SHADE(*p) - GROOVE * a / 15;
     if (v < 1) v = 1;
     *p = (uint8_t)(v | ((*p & IG_RECESS) || a > 6 ? IG_RECESS : 0));
 }
@@ -422,7 +408,7 @@ void ingot_engrave_text(uint8_t *buf, const font_t *f, const char *s, float x, i
 {
     egctx_t c = { buf, f };
     onlyctx_t o1 = { eg_light, &c, only_char }, o2 = { eg_dark, &c, only_char };
-    text_walk(f, s, x, baseline, track, 0, SCR_H, only_px, &o1);
+    (void)o1;
     text_walk(f, s, x, baseline, track, 0, SCR_H, only_px, &o2);
 }
 
@@ -543,14 +529,14 @@ void ingot_engrave_rule(uint8_t *buf, int x0, int x1, int y)
     for (int x = x0; x <= x1; x++) {
         if (abs(x - cx) < 6) continue;
         uint8_t *p = &buf[y * SCR_W + x], *q = &buf[(y + 1) * SCR_W + x];
-        if (*p) *p = (uint8_t)((int)(IG_SHADE(*p) * 0.45f) | IG_RECESS);
-        if (*q) { int v = IG_SHADE(*q) + 18; *q = (uint8_t)((v > 127 ? 127 : v) | (*q & IG_RECESS)); }
+        (void)q;
+        if (*p) *p = (uint8_t)((IG_SHADE(*p) - GROOVE * 3 / 4) | IG_RECESS);
     }
     for (int dy = -3; dy <= 3; dy++)
         for (int dx = -3; dx <= 3; dx++) {
             if (abs(dx) + abs(dy) > 3) continue;
             uint8_t *p = &buf[(y + dy) * SCR_W + cx + dx];
-            if (*p) *p = (uint8_t)((int)(IG_SHADE(*p) * 0.5f) | IG_RECESS);
+            if (*p) *p = (uint8_t)((IG_SHADE(*p) - GROOVE * 3 / 4) | IG_RECESS);
         }
 }
 

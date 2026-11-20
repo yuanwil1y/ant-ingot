@@ -4,7 +4,7 @@
 #include "nvs.h"
 
 #define NS "ingot"
-#define TUNE_VER 1
+#define TUNE_VER 2
 
 void store_init(void)
 {

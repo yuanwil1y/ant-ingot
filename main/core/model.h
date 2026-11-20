@@ -75,6 +75,11 @@ typedef struct {
     int   brightness;       /* 5..100 */
     int   led;              /* 0..100 */
     int   preview_days;     /* -1 = real age; otherwise preview patina (not saved) */
+    float tilt_gain;        /* how far the light swings per g of tilt */
+    float shadow_px;        /* cast-shadow length */
+    float silk;             /* guilloche shimmer strength 0..1 */
+    float desk_drift;       /* 0 = shimmer only when moved; >0 = slow drift on the desk */
+    int   tilt_flip_x, tilt_flip_y, tilt_swap;   /* IMU axis fixes */
 } tune_t;
 
 static inline tune_t tune_defaults(void)
@@ -86,6 +91,8 @@ static inline tune_t tune_defaults(void)
         .mint_speed = 1.0f, .burin_ms = 38,
         .longpress_ms = 700, .zoom_ms = 7500,
         .brightness = 85, .led = 50, .preview_days = -1,
+        .tilt_gain = 1.0f, .shadow_px = 1.5f, .silk = 0.5f, .desk_drift = 0,
+        .tilt_flip_x = 0, .tilt_flip_y = 0, .tilt_swap = 0,
     };
     return t;
 }

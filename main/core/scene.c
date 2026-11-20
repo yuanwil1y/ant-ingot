@@ -119,6 +119,10 @@ static struct {
     int zphase;                 /* 0 out, 1 hold, 2 back in */
     double ztotal;
 
+    /* light */
+    float tx, ty, tx_applied, ty_applied, drift, still_t;
+    float ref_tx, ref_ty;
+
     /* touch */
     bool pressed;
     float press_t;
@@ -246,7 +250,7 @@ static void build_band_rows(void)
         for (int y = S.lay.bands[b].y0; y <= S.lay.bands[b].y1 && y < SCR_H; y++) S.band_of_row[y] = (int8_t)b;
 }
 
-#define SURF_VERSION 4u
+#define SURF_VERSION 5u
 #define BASE_SEED 0x5eedu
 
 static void ensure_base(void)
@@ -388,7 +392,60 @@ static void build_back(bool engraved)
 /* ================================================================== renderers */
 
 /* Metal face: index image through palette, plus glint, stamp offset, mint reveal. */
-static void render_metal(strip_t *st, const uint8_t *buf, const uint16_t *lut, bool minting)
+/* ---------------------------------------------------------------- lighting
+ * Faces are height maps (bit 7 = recessed, bits 0..6 = height). Light comes from a
+ * direction that follows the device's tilt: diffuse from the height gradient, a
+ * short cast shadow from the neighbour toward the light, broad studio reflections
+ * that slide with the tilt, and a fine grating that beats against the guilloche. */
+
+#define RN 820
+#define ROFF0 230
+
+typedef struct {
+    int lx, ly;             /* light direction in the screen plane, *512 */
+    int shx, shy;           /* cast-shadow sample offset (px, toward the light) */
+    int roff;               /* reflection table shift */
+    int silk_amp, silk_ca, silk_sa, silk_phase;   /* grating */
+    int16_t R[2][RN];       /* studio reflections: front polished, back brushed */
+    uint32_t key;
+} light_t;
+static light_t LT;
+
+static void light_update(float tx, float ty, float silk, float shadow_px, float drift_phase)
+{
+    /* light toward world-up: opposite of gravity in the screen plane, biased to the upper left */
+    float Lx = -tx * 0.9f - 0.30f, Ly = -ty * 0.9f - 0.45f;
+    float l = sqrtf(Lx * Lx + Ly * Ly);
+    if (l > 1) { Lx /= l; Ly /= l; }
+    int lx = (int)lrintf(Lx * 512), ly = (int)lrintf(Ly * 512);
+    float ln = sqrtf(Lx * Lx + Ly * Ly) + 1e-3f;
+    int shx = (int)lrintf(Lx / ln * shadow_px), shy = (int)lrintf(Ly / ln * shadow_px);
+    int roff = (int)lrintf(tx * 150 + ty * 110);
+    float ang = 0.55f + tx * 0.35f;
+    int ca = (int)lrintf(cosf(ang) * 256 / 1.9f), sa = (int)lrintf(sinf(ang) * 256 / 1.9f);   /* period ~1.9 px */
+    int ph = (int)lrintf((tx * 3.1f + ty * 2.3f + drift_phase) * 256) & 0xFFFF;
+    int amp = (int)lrintf(silk * 22);
+    uint32_t key = hash32(lx * 7 + ly) ^ hash32(roff * 13 + shx * 3 + shy) ^ hash32(ca * 31 + sa) ^ hash32(ph * 5 + amp);
+    if (key == LT.key) return;
+    LT.key = key;
+    LT.lx = lx; LT.ly = ly; LT.shx = shx; LT.shy = shy;
+    LT.silk_amp = amp; LT.silk_ca = ca; LT.silk_sa = sa; LT.silk_phase = ph;
+    if (roff != LT.roff || !LT.R[0][0]) {
+        LT.roff = roff;
+        for (int i = 0; i < RN; i++) {
+            float u = (float)(i - ROFF0 - roff);
+            float g1 = (u - 87) / 40, g2 = (u - 231) / 54, g3 = (u - 343) / 29;
+            LT.R[0][i] = (int16_t)(40 + 52 * expf(-g1 * g1) + 30 * expf(-g2 * g2) + 12 * expf(-g3 * g3));
+            float b1 = (u - 108) / 58, b2 = (u - 267) / 72;
+            LT.R[1][i] = (int16_t)(50 + 32 * expf(-b1 * b1) + 20 * expf(-b2 * b2));
+        }
+    }
+    S.dirty = true;
+}
+
+static inline int tri256(int v) { v &= 0xFF; return v < 128 ? v * 2 : (255 - v) * 2; }
+
+static void render_metal_k(strip_t *st, const uint8_t *buf, const uint16_t *lut, bool minting, int kind)
 {
     int dy = (int)lrintf(S.dy);
     int gx = S.g_gx, gy = S.g_gy;
@@ -407,50 +464,83 @@ static void render_metal(strip_t *st, const uint8_t *buf, const uint16_t *lut, b
     }
     int r2 = (int)(rr * rr), rin2 = rin > 0 ? (int)(rin * rin) : 0;
     int hotk = minting ? (int)(255 * clampf(S.mp_front.heat * 1.6f, 0.25f, 1)) : 0;
+    const int16_t *R = LT.R[kind];
+    const int lx = LT.lx, ly = LT.ly, shx = LT.shx, shy = LT.shy;
+    const bool silk = kind == 0 && LT.silk_amp > 0 && !minting;
+    const int silk_r2 = 58 * 58;
     for (int yy = 0; yy < st->h; yy++) {
         int y = st->y0 + yy;
         int sy = y - dy;
         uint16_t *o = &st->px[yy * SCR_W];
-        if (sy < 0 || sy >= SCR_H) { for (int x = 0; x < SCR_W; x++) o[x] = S.bg_row[y]; continue; }
-        const uint8_t *row = &buf[sy * SCR_W];
-        const uint8_t *brow = (minting && S.base) ? &S.base[sy * SCR_W] : row;
+        if (sy < 1 || sy >= SCR_H - 1) { for (int x = 0; x < SCR_W; x++) o[x] = S.bg_row[y]; continue; }
         int band = S.band_of_row[sy];
         int dyc = sy - rcy;
         bool rosrow = minting && dyc * dyc < (int)(S.lay.rmax * S.lay.rmax) + 64;
+        bool silkrow = silk && dyc * dyc < silk_r2;
         int add_row = (minting && band >= 0) ? flash[band] : 0;
         bool row_revealed = !minting || (band >= 0 ? bandt[band] : !rosrow);
+        const uint8_t *F = buf;
+        const uint8_t *B = (minting && S.base) ? S.base : buf;
         int gbase = sy * gy;
-        for (int x = 0; x < SCR_W; x++) {
-            int idx;
-            int add = add_row;
+        int sys = sy + shy;
+        if (sys < 0) sys = 0;
+        if (sys >= SCR_H) sys = SCR_H - 1;
+        int ubase = sy * 15, sbase = sy * LT.silk_sa + LT.silk_phase;
+        for (int x = 1; x < SCR_W - 1; x++) {
+            const uint8_t *src;
             int hot = 0;
             if (rosrow) {
                 int dx = x - rcx;
                 int d2 = dx * dx + dyc * dyc;
                 if (d2 < r2) {
-                    idx = row[x];
+                    src = F;
                     if (d2 >= rin2 && r2 > rin2) hot = (d2 - rin2) * 255 / (r2 - rin2);
-                } else idx = brow[x];
+                } else src = B;
             } else {
-                idx = row_revealed ? row[x] : brow[x];
+                src = row_revealed ? F : B;
             }
+            int i = sy * SCR_W + x;
+            int idx = src[i];
             if (!idx) { o[x] = S.bg_row[y]; continue; }
-            int s = idx & 127;
+            int h = idx & 127;
+            int ddx = (src[i + 1] & 127) - (src[i - 1] & 127);
+            int ddy = (src[i + SCR_W] & 127) - (src[i - SCR_W] & 127);
+            int s = R[((x * 7 + ubase) >> 4) + ROFF0 + LT.roff] - ((ddx * lx + ddy * ly) >> 8);
+            /* a short shadow cast by whatever stands between this pixel and the light */
+            int xs = x + shx;
+            if (xs >= 0 && xs < SCR_W) {
+                int hs = src[sys * SCR_W + xs] & 127;
+                if (hs > h + 3) s -= (hs - h) >> 1;
+            }
+            if (idx & 128) {
+                s -= 15;            /* groove floors catch less light: keeps the lettering legible */
+                if (silkrow) {
+                    int dx = x - rcx;
+                    if (dx * dx + dyc * dyc < silk_r2) s += ((tri256(x * LT.silk_ca + sbase) - 255) * LT.silk_amp) >> 8;
+                }
+            }
             if (gl) {
                 int gi = ((x * gx + gbase) * 6554) >> 16;   /* /10 */
                 if (gi >= 0 && gi < GL_N) s += (idx & 128) ? S.glint[gi] >> 2 : S.glint[gi];
             }
-            s += add;
+            s += add_row;
             if (s > 127) s = 127;
             if (s < 1) s = 1;
             uint16_t c = lut[(idx & 128) | s];
             if (hot) {
-                int h = hot * hotk >> 8;
-                c = add565(c, h, h * 6 / 10, h / 5);
+                int hh = hot * hotk >> 8;
+                c = add565(c, hh, hh * 6 / 10, hh / 5);
             }
             o[x] = c;
         }
+        o[0] = S.bg_row[y];
+        o[SCR_W - 1] = S.bg_row[y];
     }
+}
+
+static void render_metal(strip_t *st, const uint8_t *buf, const uint16_t *lut, bool minting)
+{
+    render_metal_k(st, buf, lut, minting, buf == S.back ? 1 : 0);
 }
 
 /* ---------------------------------------------------------------- setup tag */
@@ -830,7 +920,7 @@ static uint32_t chart_rev_now(void)
 static void draw_chart(strip_t *st, int alpha, int yoff)
 {
     if (!CHT.ok || !CHT.mask || alpha <= 0) return;
-    uint16_t line = C_GOLD_HI, fill = rgb565(150, 110, 40);
+    uint16_t line = C_GOLD_HI;
     int y0 = CH_Y0 + yoff;
     int r1 = isnan(CHT.ref1) ? -999 : (int)lrintf(chart_y(CHT.ref1));
     int r2 = isnan(CHT.ref2) ? -999 : (int)lrintf(chart_y(CHT.ref2));
@@ -1258,7 +1348,8 @@ static void render_zoom(strip_t *st)
                 uint16_t cc;
                 if (tex && src_y >= 0 && src_y < SCR_H && src_x[x] >= 0 && src_x[x] < SCR_W) {
                     int id = S.front[src_y * SCR_W + src_x[x]];
-                    cc = id ? S.lut_front[id] : bg;
+                    int hs = (id & 127) - 25;
+                    cc = id ? S.lut_front[(id & 128) | (hs < 1 ? 1 : hs)] : bg;
                     if (!you) {
                         uint32_t h = hash32((uint32_t)cell_x[x] * 73856093u ^ (uint32_t)cell_y * 19349663u);
                         cc = scale565(cc, 120 + (h & 31));
@@ -1481,6 +1572,36 @@ void scene_tick(float dt, const input_t *in)
     if (S.fade < 1) S.fade = fminf(1, S.fade + dt / 0.6f);
 
     bool act = in->shake || in->touch || in->btn_short;
+
+    /* ---- tilt → light. Light only re-renders when it actually moves. */
+    {
+        float ax = in->tilt_valid ? in->tilt_x : 0, ay = in->tilt_valid ? in->tilt_y : 0;
+        if (tu->tilt_swap) { float t = ax; ax = ay; ay = t; }
+        if (tu->tilt_flip_x) ax = -ax;
+        if (tu->tilt_flip_y) ay = -ay;
+        ax *= tu->tilt_gain;
+        ay *= tu->tilt_gain;
+        float k = clampf(dt / 0.09f, 0, 1);
+        S.tx += (ax - S.tx) * k;
+        S.ty += (ay - S.ty) * k;
+        S.drift += dt * tu->desk_drift * 0.2f;
+        bool moved = fabsf(S.tx - S.tx_applied) > 0.004f || fabsf(S.ty - S.ty_applied) > 0.004f || tu->desk_drift > 0;
+        if (moved || !LT.key) {
+            S.tx_applied = S.tx;
+            S.ty_applied = S.ty;
+            light_update(S.tx, S.ty, tu->silk, tu->shadow_px, S.drift);
+        }
+        /* picked up after resting: wake, and let a first light run across the face */
+        float dmove = fabsf(S.tx - S.ref_tx) + fabsf(S.ty - S.ref_ty);
+        if (dmove > 0.12f) {
+            if (S.still_t > 45 && S.st == ST_FACES && !S.flipping) glint_start(0.9f, 26, 22, 6, 8, 0);
+            S.ref_tx = S.tx; S.ref_ty = S.ty;
+            S.still_t = 0;
+            act = true;
+        } else {
+            S.still_t += dt;
+        }
+    }
     if (act) S.events |= EV_ACTIVITY;
 
     /* ---- touch: long press → zoom, tap → skip */

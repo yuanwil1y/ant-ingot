@@ -40,8 +40,9 @@ int main(int argc, char **argv)
     snprintf(M.line, sizeof M.line, "Day one. The price wobbled; I did not. Gold is patient by design.");
     M.line_day = 1;
     bool market = !strcmp(script, "market");
-    bool minted_start = !strcmp(script, "faces") || market;
-    if (market) {
+    bool tilt = !strcmp(script, "tilt");
+    bool minted_start = !strcmp(script, "faces") || market || tilt;
+    if (market || tilt) {
         M.setup.pending.price = 88.00; M.setup.pending.buy_ts = 1795185000;
         snprintf(M.setup.pending.inscription, sizeof M.setup.pending.inscription, "FOR THE LONG RUN.");
         M.now = 1795185000 + 13200;
@@ -62,7 +63,7 @@ int main(int argc, char **argv)
     const float dt = 1.0f / 30;
     float t = 0;
     int nframes = 0;
-    float end = market ? 16 : (minted_start ? 30 : 46);
+    float end = tilt ? 14 : (market ? 16 : (minted_start ? 30 : 46));
     while (t < end) {
         input_t in = { 0 };
         if (!minted_start) {
@@ -76,6 +77,21 @@ int main(int argc, char **argv)
             if (t >= 5.5f && M.setup.stage != SETUP_READY && !M.mint.minted) M.setup.stage = SETUP_READY;
             /* shaking from 7.5s for ~2s, with a pause in the middle */
             if (t > 7.5f && t < 10.2f && !(t > 8.4f && t < 8.8f)) in.shake_energy = 1.4f + 0.4f * sinf(t * 9);
+        }
+        if (tilt) {
+            /* held upright, a slow wrist wobble, then laid flat on the desk, then the back */
+            in.tilt_valid = 1;
+            if (t < 9) {
+                float w = t < 1 ? t : 1;
+                in.tilt_x = 0.42f * sinf(t * 1.25f) * w;
+                in.tilt_y = 0.80f + 0.18f * sinf(t * 0.8f + 1.0f) * w;
+            } else { in.tilt_x = 0.25f * sinf(t * 1.6f); in.tilt_y = 0.85f; }
+            if (fabsf(t - 9.0f) < dt / 2) in.shake = 1;
+            scene_tick(dt, &in);
+            scene_take_events();
+            frame(stdout, scale);
+            t += dt;
+            continue;
         }
         if (market) {
             if (fabsf(t - 1.0f) < dt / 2 || fabsf(t - 3.5f) < dt / 2) in.shake = 1;

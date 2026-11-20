@@ -571,6 +571,13 @@ static void add_tune(cJSON *o, const tune_t *t)
     cJSON_AddNumberToObject(o, "brightness", t->brightness);
     cJSON_AddNumberToObject(o, "led", t->led);
     cJSON_AddNumberToObject(o, "preview_days", t->preview_days);
+    cJSON_AddNumberToObject(o, "tilt_gain", t->tilt_gain);
+    cJSON_AddNumberToObject(o, "shadow_px", t->shadow_px);
+    cJSON_AddNumberToObject(o, "silk", t->silk);
+    cJSON_AddNumberToObject(o, "desk_drift", t->desk_drift);
+    cJSON_AddNumberToObject(o, "tilt_flip_x", t->tilt_flip_x);
+    cJSON_AddNumberToObject(o, "tilt_flip_y", t->tilt_flip_y);
+    cJSON_AddNumberToObject(o, "tilt_swap", t->tilt_swap);
 }
 
 static esp_err_t h_state(httpd_req_t *r)
@@ -728,6 +735,13 @@ static esp_err_t h_tune(httpd_req_t *r)
     t->brightness = (int)jnum(j, "brightness", t->brightness);
     t->led = (int)jnum(j, "led", t->led);
     t->preview_days = (int)jnum(j, "preview_days", t->preview_days);
+    t->tilt_gain = jnum(j, "tilt_gain", t->tilt_gain);
+    t->shadow_px = jnum(j, "shadow_px", t->shadow_px);
+    t->silk = jnum(j, "silk", t->silk);
+    t->desk_drift = jnum(j, "desk_drift", t->desk_drift);
+    t->tilt_flip_x = (int)jnum(j, "tilt_flip_x", t->tilt_flip_x);
+    t->tilt_flip_y = (int)jnum(j, "tilt_flip_y", t->tilt_flip_y);
+    t->tilt_swap = (int)jnum(j, "tilt_swap", t->tilt_swap);
     tune_t copy = *t;
     UNLOCK();
     if (cJSON_IsTrue(cJSON_GetObjectItem(j, "save"))) store_save_tune(&copy);

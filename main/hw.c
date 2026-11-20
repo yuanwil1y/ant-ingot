@@ -157,6 +157,8 @@ static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_touch, s_imu;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static struct {
+    float gx, gy;
+    bool gvalid;
     float energy;
     bool shake, touch, btn_short, btn_long;
     int tx, ty;
@@ -198,7 +200,7 @@ static bool imu_init(void)
 
 static void input_task(void *arg)
 {
-    float g[3] = { 0, 0, 1 };
+    float g[3] = { 0, 0, 1 }, gf[3] = { 0, 0, 1 };
     bool g_init = false, armed = true;
     float energy = 0;
     int64_t last_peak = 0;
@@ -217,7 +219,8 @@ static void input_task(void *arg)
             if (reg_read(s_imu, 0x35, b, 6) == ESP_OK) {
                 float a[3];
                 for (int i = 0; i < 3; i++) a[i] = (int16_t)(b[2 * i] | (b[2 * i + 1] << 8)) / 4096.0f;
-                if (!g_init) { memcpy(g, a, sizeof g); g_init = true; }
+                if (!g_init) { memcpy(g, a, sizeof g); memcpy(gf, a, sizeof gf); g_init = true; }
+                for (int i = 0; i < 3; i++) gf[i] += (a[i] - gf[i]) * 0.07f;   /* ~70 ms, for the light */
                 float hp[3], mag2 = 0;
                 for (int i = 0; i < 3; i++) {
                     g[i] += (a[i] - g[i]) * 0.012f;          /* ~0.4 s gravity estimate */
@@ -241,6 +244,9 @@ static void input_task(void *arg)
                 }
                 taskENTER_CRITICAL(&s_mux);
                 s_in.energy = energy;
+                s_in.gx = gf[0];
+                s_in.gy = gf[1];
+                s_in.gvalid = true;
                 if (ev) s_in.shake = true;
                 taskEXIT_CRITICAL(&s_mux);
             }
@@ -300,6 +306,9 @@ void hw_inputs_take(hw_input_t *o, const tune_t *t)
     s_thresh = t->shake_g;
     taskENTER_CRITICAL(&s_mux);
     o->energy = s_in.energy;
+    o->gx = s_in.gx;
+    o->gy = s_in.gy;
+    o->gvalid = s_in.gvalid;
     o->shake = s_in.shake;
     o->touch = s_in.touch;
     o->tx = s_in.tx;

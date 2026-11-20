@@ -14,6 +14,8 @@ typedef struct {
     bool touch;
     int tx, ty;
     bool btn_short;         /* BOOT button click */
+    bool tilt_valid;
+    float tilt_x, tilt_y;   /* gravity in the IMU's x/y axes, g (lightly smoothed) */
 } input_t;
 
 enum {

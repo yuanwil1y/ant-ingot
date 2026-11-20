@@ -74,6 +74,7 @@ void app_main(void)
         input_t in = {
             .shake_energy = hi.energy, .shake = hi.shake, .touch = hi.touch,
             .tx = hi.tx, .ty = hi.ty, .btn_short = hi.btn_short,
+            .tilt_valid = hi.gvalid, .tilt_x = hi.gx, .tilt_y = hi.gy,
         };
 
         xSemaphoreTake(L, portMAX_DELAY);

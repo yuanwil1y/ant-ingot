@@ -17,6 +17,8 @@ bool hw_inputs_init(void);
 /* thread-safe snapshot of the sensors; consumes the edge events */
 typedef struct {
     float energy;
+    float gx, gy;           /* gravity in the IMU frame, g, ~70 ms smoothing */
+    bool gvalid;
     bool shake;
     bool touch;
     int tx, ty;

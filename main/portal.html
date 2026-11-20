@@ -178,6 +178,13 @@ const SL=[
  ['brightness','Screen brightness',5,100,1],
  ['led','LED brightness',0,100,1],
  ['preview_days','Preview age (days, not saved)',-1,3650,1],
+ ['tilt_gain','Light follows tilt',0,2.5,0.05],
+ ['shadow_px','Engraving shadow (px)',0,3,0.1],
+ ['silk','Guilloche shimmer',0,1,0.05],
+ ['desk_drift','Shimmer on the desk (0 = off)',0,1,0.05],
+ ['tilt_flip_x','Flip tilt X (0/1)',0,1,1],
+ ['tilt_flip_y','Flip tilt Y (0/1)',0,1,1],
+ ['tilt_swap','Swap tilt X/Y (0/1)',0,1,1],
 ];
 let tuneTimer=null,pending={};
 function initSettings(){
