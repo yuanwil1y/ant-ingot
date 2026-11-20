@@ -98,6 +98,7 @@ static struct {
     float zm_a, zm_b1, zm_b2;   /* how deep each mask is cut (0 = melted flat) */
     float zflash[2];
     int as_phase;               /* 0 idle, 1 holding after mint, 2 assaying */
+    int32_t heal_day;
     float as_t, as_wait;
     assay_t as_new;
     float furnace;              /* 0..1 market-open glow */
@@ -540,27 +541,32 @@ static void zone_show(double price, double grams)
 }
 
 /* The latest official close we know of, as an ET day index. */
+/* The latest official close we know of, as an ET day index. Only a quote stamped at or
+ * after that day's close counts; intraday prices never do, and nothing is weighed
+ * before the clock is set. */
 static bool latest_close(int32_t *day)
 {
-    const quote_t *q = &S.m->quote;
+    const model_t *m = S.m;
+    const quote_t *q = &m->quote;
+    if (m->now <= 0) return false;
     if (!q->valid || strlen(q->when) < 16) return false;
-    if (S.m->now > 0 && q->fetched_ts > 0 && S.m->now - q->fetched_ts > 1800) return false;
+    if (q->fetched_ts <= 0 || m->now - q->fetched_ts > 1800) return false;
     int Y = atoi(q->when), Mo = atoi(q->when + 5), D = atoi(q->when + 8);
     int hh = atoi(q->when + 11), mi = atoi(q->when + 14);
-    if (hh * 60 + mi < 9 * 60 + 30) return false;
     int32_t d = ymd_to_days_s(Y * 10000 + Mo * 100 + D);
-    /* give the official close a few minutes to settle before weighing it (half days close early) */
-    if (S.m->now > 0) {
-        int64_t et = S.m->now + us_et_offset(S.m->now);
-        int64_t close_at = 0;
-        session_state(S.m, S.m->now, NULL, &close_at);
-        if (et / 86400 == d && close_at > 0 && S.m->now < close_at + 5 * 60) return false;
-        if (et / 86400 == d && close_at <= 0 && (et % 86400) < 16 * 3600 + 5 * 60) return false;
-    }
+    /* that day's closing time: the exchange calendar knows half days, otherwise 16:00 */
+    int close_min = 16 * 60;
+    const session_t *ss = &m->session;
+    if (ss->valid && ss->business && ss->close > 0 && ss->day == d)
+        close_min = (int)(((ss->close + us_et_offset(ss->close)) % 86400) / 60);
+    if (hh * 60 + mi < close_min) return false;
+    /* give the official close a few minutes to settle */
+    int64_t et_now = m->now + us_et_offset(m->now);
+    if (et_now / 86400 == d && (et_now % 86400) < (int64_t)close_min * 60 + 5 * 60) return false;
     /* only closes after the purchase count */
-    int64_t close_utc = (int64_t)d * 86400 + (hh * 60 + mi) * 60;
+    int64_t close_utc = (int64_t)d * 86400 + close_min * 60;
     close_utc -= us_et_offset(close_utc);
-    if (close_utc <= S.m->mint.p.buy_ts) return false;
+    if (close_utc <= m->mint.p.buy_ts) return false;
     *day = d;
     return true;
 }
@@ -589,8 +595,12 @@ static void zone_tick(float dt)
     /* a close we have not weighed yet → the ceremony (waits briefly for a gold price) */
     if (S.as_phase == 0 && ms != MKT_OPEN && !S.flipping && S.st == ST_FACES) {
         int32_t d;
-        if (latest_close(&d) && (!m->assay.valid || d > m->assay.close_day)) {
-            if (m->quote.gold > 0 || S.as_wait > 90) start_assay(d);
+        /* a newer close, or today's weighing disagrees with the official close (re-weigh once) */
+        bool newer = latest_close(&d) && (!m->assay.valid || d > m->assay.close_day);
+        bool wrong = !newer && latest_close(&d) && m->assay.valid && d == m->assay.close_day &&
+                     fabs(m->assay.price - m->quote.price) >= 0.005 && S.heal_day != d;
+        if (newer || wrong) {
+            if (m->quote.gold > 0 || S.as_wait > 90) { if (wrong) S.heal_day = d; start_assay(d); }
             else S.as_wait += dt;
         }
     }

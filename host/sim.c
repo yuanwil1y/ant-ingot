@@ -42,8 +42,9 @@ int main(int argc, char **argv)
     bool market = !strcmp(script, "market");
     bool tilt = !strcmp(script, "tilt");
     bool assay = !strcmp(script, "assay");
-    bool minted_start = !strcmp(script, "faces") || market || tilt || assay;
-    if (market || tilt || assay) {
+    bool heal = !strcmp(script, "heal");     /* the v0.4.6 bug: boot before the clock is set */
+    bool minted_start = !strcmp(script, "faces") || market || tilt || assay || heal;
+    if (market || tilt || assay || heal) {
         M.setup.pending.price = 88.00; M.setup.pending.buy_ts = 1795185000;
         snprintf(M.setup.pending.inscription, sizeof M.setup.pending.inscription, "FOR THE LONG RUN.");
         M.now = 1795185000 + 13200;
@@ -70,7 +71,7 @@ int main(int argc, char **argv)
     const float dt = 1.0f / 30;
     float t = 0;
     int nframes = 0;
-    float end = assay ? 12 : (tilt ? 14 : (market ? 16 : (minted_start ? 30 : 46)));
+    float end = heal ? 10 : assay ? 12 : (tilt ? 14 : (market ? 16 : (minted_start ? 30 : 46)));
     while (t < end) {
         input_t in = { 0 };
         if (!minted_start) {
@@ -85,6 +86,26 @@ int main(int argc, char **argv)
             /* shaking from 7.5s for ~2s, with a pause in the middle */
             if (t > 7.5f && t < 10.2f && !(t > 8.4f && t < 8.8f)) in.shake_energy = 1.4f + 0.4f * sinf(t * 9);
         }
+        if (heal) {
+            /* 0-3 s: no clock yet, intraday quote (must NOT weigh). 3-6 s: clock set, market open.
+               6 s: after the close, with a stale wrong weighing on record → re-weigh once. */
+            static int phase = -1;
+            if (phase < 0) { M.now = 0; snprintf(M.quote.when, sizeof M.quote.when, "2026-11-20 13:10:00"); M.quote.price = 87.45; phase = 0; }
+            if (t >= 3 && phase == 0) { M.now = 1795185000 + 13200; phase = 1; }
+            if (t >= 6 && phase == 1) {
+                M.assay = (assay_t){ .valid = 1, .price = 87.45, .grams = 0.77, .close_day = 20777 };
+                M.now = 1795185000 + 23800; M.quote.price = 88.36;
+                snprintf(M.quote.when, sizeof M.quote.when, "2026-11-20 16:00:01");
+                phase = 2;
+            }
+            M.quote.fetched_ts = M.now;
+            scene_tick(dt, &in);
+            uint32_t ev = scene_take_events();
+            if (ev & EV_ASSAY) fprintf(stderr, "t=%.2f assay -> $%.2f day %d\n", t, M.assay.price, M.assay.close_day);
+            frame(stdout, scale);
+            t += dt;
+            continue;
+        }
         if (assay) {
             /* market open: the letters glow; then the close arrives and the bar is weighed */
             in.tilt_valid = 1; in.tilt_x = 0.1f * sinf(t * 0.7f); in.tilt_y = 0.85f;
@@ -95,7 +116,7 @@ int main(int argc, char **argv)
             }
             M.quote.fetched_ts = M.now;
             scene_tick(dt, &in);
-            scene_take_events();
+            if (scene_take_events() & EV_ASSAY) fprintf(stderr, "t=%.2f assay -> $%.2f day %d\n", t, M.assay.price, M.assay.close_day);
             frame(stdout, scale);
             t += dt;
             continue;
