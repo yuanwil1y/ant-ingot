@@ -269,7 +269,7 @@ static void build_band_rows(void)
         for (int y = S.lay.bands[b].y0; y <= S.lay.bands[b].y1 && y < SCR_H; y++) S.band_of_row[y] = (int8_t)b;
 }
 
-#define SURF_VERSION 7u
+#define SURF_VERSION 8u
 #define BASE_SEED 0x5eedu
 
 static void ensure_base(void)
@@ -281,6 +281,7 @@ static void ensure_base(void)
     uint8_t *buf = malloc(SCR_W * SCR_H);
     if (!buf) return;
     ingot_gen_base(buf, BASE_SEED, 0);
+    ingot_bake_inplace(buf, 0);
     S.base = surf_commit(0, key, buf);
 }
 
@@ -294,11 +295,11 @@ static bool ensure_front(const purchase_t *p, uint32_t serial)
     for (const char *c = p->inscription; *c; c++) key = hash32(key ^ (uint8_t)*c);
     S.front = surf_lookup(1, key);
     if (!S.front) {
-        ensure_base();
         uint8_t *buf = malloc(SCR_W * SCR_H);
-        if (!buf || !S.base) { free(buf); return false; }
+        if (!buf) return false;
         mint_rec_t r = { .minted = true, .p = *p, .serial = serial };
-        ingot_gen_front(buf, S.base, &r, &S.lay);
+        ingot_gen_front(buf, BASE_SEED, &r, &S.lay);
+        ingot_bake_inplace(buf, 0);
         S.front = surf_commit(1, key, buf);
         if (!S.front) return false;
     }
@@ -431,34 +432,48 @@ static double grams_for(double price)
     return gold > 0 ? price * sh / (gold / TROY_OZ_G) : 0;
 }
 
+#define ZM 3                 /* height rows kept above/below the zone for lighting */
+static uint8_t *ZBASE;      /* base heights for rows ZONE_Y0-ZM .. ZONE_Y1+ZM */
+static uint8_t *ZH_TMP;
+
 static void zbuild(void)
 {
-    if (!S.zbuf || !S.front) return;
-    for (int r = ZONE_Y0 - 1; r <= ZONE_Y1 + 1; r++) {
-        const uint8_t *f = S.front + r * SCR_W;
-        uint8_t *o = S.zbuf + (r - (ZONE_Y0 - 1)) * SCR_W;
-        int zr = r - ZONE_Y0;
-        if (zr < 0 || zr >= ZONE_H) { memcpy(o, f, SCR_W); continue; }
-        int mb = (int)(256 * (r <= ZONE_PRICE_Y1 ? S.zm_b1 : S.zm_b2));
+    if (!S.zbuf || !ZBASE || !ZH_TMP) return;
+    const int rows = ZONE_H + 2 * ZM;
+    for (int r = 0; r < rows; r++) {
+        int zr = r - ZM;
+        const uint8_t *b = ZBASE + r * SCR_W;
+        uint8_t *o = ZH_TMP + r * SCR_W;
+        if (zr < 0 || zr >= ZONE_H) { memcpy(o, b, SCR_W); continue; }
+        int y = ZONE_Y0 + zr;
+        int mb = (int)(256 * (y <= ZONE_PRICE_Y1 ? S.zm_b1 : S.zm_b2));
         int ma = (int)(256 * S.zm_a);
         const uint8_t *ia = S.zink_a + zr * SCR_W, *ib = S.zink_b + zr * SCR_W;
         for (int x = 0; x < SCR_W; x++) {
-            if (!f[x]) { o[x] = 0; continue; }
-            int a = ia[x] * ma >> 8, b = ib[x] * mb >> 8;
-            int ink = a > b ? a : b;
-            int h = (f[x] & 127) - GROOVE_DEPTH * ink / 255;
+            if (!b[x]) { o[x] = 0; continue; }
+            int a = ia[x] * ma >> 8, bb = ib[x] * mb >> 8;
+            int ink = a > bb ? a : bb;
+            int h = (b[x] & 127) - GROOVE_DEPTH * ink / 255;
             if (h < 1) h = 1;
-            o[x] = (uint8_t)(h | ((f[x] & 128) || ink > 107 ? 128 : 0));
+            o[x] = (uint8_t)(h | ((b[x] & 128) || ink > 107 ? 128 : 0));
         }
     }
+    ingot_bake_rows(ZH_TMP, ZONE_Y0 - ZM, rows, S.zbuf, ZONE_Y0, ZONE_Y1 + 1, 0);
 }
 
 static bool zone_alloc(void)
 {
     if (!S.zink_a) S.zink_a = calloc(ZONE_H, SCR_W);
     if (!S.zink_b) S.zink_b = calloc(ZONE_H, SCR_W);
-    if (!S.zbuf) S.zbuf = calloc(ZONE_H + 2, SCR_W);
-    return S.zink_a && S.zink_b && S.zbuf;
+    if (!S.zbuf) S.zbuf = calloc(ZONE_H, SCR_W);
+    if (!ZH_TMP) ZH_TMP = calloc(ZONE_H + 2 * ZM, SCR_W);
+    if (!ZBASE) {
+        ZBASE = calloc(ZONE_H + 2 * ZM, SCR_W);
+        if (ZBASE)
+            for (int r = 0; r < ZONE_H + 2 * ZM; r++)
+                for (int x = 0; x < SCR_W; x++) ZBASE[r * SCR_W + x] = (uint8_t)ingot_base_h(x, ZONE_Y0 - ZM + r, BASE_SEED, 0);
+    }
+    return S.zink_a && S.zink_b && S.zbuf && ZH_TMP && ZBASE;
 }
 
 /* Show a weighing immediately (no ceremony). */
@@ -575,69 +590,13 @@ static void zone_tick(float dt)
 /* ================================================================== renderers */
 
 /* Metal face: index image through palette, plus glint, stamp offset, mint reveal. */
-/* ---------------------------------------------------------------- lighting
- * Faces are height maps (bit 7 = recessed, bits 0..6 = height). Light comes from a
- * direction that follows the device's tilt: diffuse from the height gradient, a
- * short cast shadow from the neighbour toward the light, broad studio reflections
- * that slide with the tilt, and a fine grating that beats against the guilloche. */
-
-#define RN 820
-#define ROFF0 230
-
-typedef struct {
-    int lx, ly;             /* light direction in the screen plane, *512 */
-    int shx, shy;           /* cast-shadow sample offset (px, toward the light) */
-    int roff;               /* reflection table shift */
-    int silk_amp, silk_ca, silk_sa, silk_phase;   /* grating */
-    int16_t R[2][RN];       /* studio reflections: front polished, back brushed */
-    uint32_t key;
-} light_t;
-static light_t LT;
-
-static void light_update(float tx, float ty, float silk, float shadow_px, float drift_phase)
-{
-    /* light toward world-up: opposite of gravity in the screen plane, biased to the upper left */
-    float Lx = -tx * 0.9f - 0.30f, Ly = -ty * 0.9f - 0.45f;
-    float l = sqrtf(Lx * Lx + Ly * Ly);
-    if (l > 1) { Lx /= l; Ly /= l; }
-    int lx = (int)lrintf(Lx * 512), ly = (int)lrintf(Ly * 512);
-    float ln = sqrtf(Lx * Lx + Ly * Ly) + 1e-3f;
-    int shx = (int)lrintf(Lx / ln * shadow_px), shy = (int)lrintf(Ly / ln * shadow_px);
-    int roff = (int)lrintf(tx * 150 + ty * 110);
-    float ang = 0.55f + tx * 0.35f;
-    int ca = (int)lrintf(cosf(ang) * 256 / 1.9f), sa = (int)lrintf(sinf(ang) * 256 / 1.9f);   /* period ~1.9 px */
-    int ph = (int)lrintf((tx * 3.1f + ty * 2.3f + drift_phase) * 256) & 0xFFFF;
-    int amp = (int)lrintf(silk * 22);
-    uint32_t key = hash32(lx * 7 + ly) ^ hash32(roff * 13 + shx * 3 + shy) ^ hash32(ca * 31 + sa) ^ hash32(ph * 5 + amp);
-    if (key == LT.key) return;
-    LT.key = key;
-    LT.lx = lx; LT.ly = ly; LT.shx = shx; LT.shy = shy;
-    LT.silk_amp = amp; LT.silk_ca = ca; LT.silk_sa = sa; LT.silk_phase = ph;
-    if (roff != LT.roff || !LT.R[0][0]) {
-        LT.roff = roff;
-        for (int i = 0; i < RN; i++) {
-            float u = (float)(i - ROFF0 - roff);
-            float g1 = (u - 87) / 40, g2 = (u - 231) / 54, g3 = (u - 343) / 29;
-            LT.R[0][i] = (int16_t)(40 + 52 * expf(-g1 * g1) + 30 * expf(-g2 * g2) + 12 * expf(-g3 * g3));
-            float b1 = (u - 108) / 58, b2 = (u - 267) / 72;
-            LT.R[1][i] = (int16_t)(50 + 32 * expf(-b1 * b1) + 20 * expf(-b2 * b2));
-        }
-    }
-    S.dirty = true;
-}
-
-static inline int tri256(int v) { v &= 0xFF; return v < 128 ? v * 2 : (255 - v) * 2; }
-
-static inline const uint8_t *rowp(const uint8_t *buf, int r)
-{
-    if (r < 0) r = 0;
-    if (r >= SCR_H) r = SCR_H - 1;
-    if (buf == S.front && S.zbuf && r >= ZONE_Y0 - 1 && r <= ZONE_Y1 + 1) return S.zbuf + (r - (ZONE_Y0 - 1)) * SCR_W;
-    return buf + r * SCR_W;
-}
+/* ---------------------------------------------------------------- renderer
+ * Surfaces are pre-lit shade indices; a frame is a palette lookup plus glint,
+ * stamp flash, mint heat and the molten glow in the living zone. */
 
 static void render_metal_k(strip_t *st, const uint8_t *buf, const uint16_t *lut, bool minting, int kind)
 {
+    (void)kind;
     int dy = (int)lrintf(S.dy);
     int gx = S.g_gx, gy = S.g_gy;
     bool gl = S.glint_on;
@@ -655,11 +614,7 @@ static void render_metal_k(strip_t *st, const uint8_t *buf, const uint16_t *lut,
     }
     int r2 = (int)(rr * rr), rin2 = rin > 0 ? (int)(rin * rin) : 0;
     int hotk = minting ? (int)(255 * clampf(S.mp_front.heat * 1.6f, 0.25f, 1)) : 0;
-    const int16_t *R = LT.R[kind];
-    const int lx = LT.lx, ly = LT.ly, shx = LT.shx, shy = LT.shy;
-    const bool silk = kind == 0 && LT.silk_amp > 0 && !minting;
-    const int silk_r2 = 58 * 58;
-    const bool zone = buf == S.front && S.zbuf && !minting;
+    const bool zone = buf == S.front && S.zbuf;
     const int zg = (int)(S.zglow * 256);
     const int zs = (int)S.zscroll;
     const int zma = (int)(256 * S.zm_a);
@@ -669,59 +624,36 @@ static void render_metal_k(strip_t *st, const uint8_t *buf, const uint16_t *lut,
         int y = st->y0 + yy;
         int sy = y - dy;
         uint16_t *o = &st->px[yy * SCR_W];
-        if (sy < 1 || sy >= SCR_H - 1) { for (int x = 0; x < SCR_W; x++) o[x] = S.bg_row[y]; continue; }
+        if (sy < 0 || sy >= SCR_H) { for (int x = 0; x < SCR_W; x++) o[x] = S.bg_row[y]; continue; }
         int band = S.band_of_row[sy];
         int dyc = sy - rcy;
         bool rosrow = minting && dyc * dyc < (int)(S.lay.rmax * S.lay.rmax) + 64;
-        bool silkrow = silk && dyc * dyc < silk_r2;
         int zr = sy - ZONE_Y0;
         bool zrow = zone && zr >= 0 && zr < ZONE_H;
         int add_row = (minting && band >= 0) ? flash[band] : 0;
-        if (zrow) add_row += (int)(S.zflash[sy <= ZONE_PRICE_Y1 ? 0 : 1] * 40);
+        if (zrow && !minting) add_row += (int)(S.zflash[sy <= ZONE_PRICE_Y1 ? 0 : 1] * 40);
         bool row_revealed = !minting || (band >= 0 ? bandt[band] : !rosrow);
-        int sys = sy + shy;
-        const uint8_t *rc[2] = { rowp(buf, sy), rowp(B, sy) };
-        const uint8_t *ru[2] = { rowp(buf, sy - 1), rowp(B, sy - 1) };
-        const uint8_t *rd[2] = { rowp(buf, sy + 1), rowp(B, sy + 1) };
-        const uint8_t *rs[2] = { rowp(buf, sys), rowp(B, sys) };
-        const uint8_t *zi = zrow ? S.zink_a + zr * SCR_W : NULL;
+        const uint8_t *F = zrow ? S.zbuf + zr * SCR_W : buf + sy * SCR_W;
+        const uint8_t *Bb = B + sy * SCR_W;
+        const uint8_t *zi = (zrow && !minting && zg) ? S.zink_a + zr * SCR_W : NULL;
         const uint8_t *nrow = NOISE[(zr + 640 - zs) & 63];
-        /* the molten pool fades out toward the zone's top and bottom */
         int ptaper = zrow ? (zr < 14 ? zr * 18 : (ZONE_H - 1 - zr < 14 ? (ZONE_H - 1 - zr) * 18 : 256)) : 0;
         int zpool_row = zpool * ptaper >> 8;
         int gbase = sy * gy;
-        int ubase = sy * 15, sbase = sy * LT.silk_sa + LT.silk_phase;
-        for (int x = 1; x < SCR_W - 1; x++) {
-            int k;
-            int hot = 0;
+        for (int x = 0; x < SCR_W; x++) {
+            int idx, hot = 0;
             if (rosrow) {
                 int dx = x - rcx;
                 int d2 = dx * dx + dyc * dyc;
                 if (d2 < r2) {
-                    k = 0;
+                    idx = F[x];
                     if (d2 >= rin2 && r2 > rin2) hot = (d2 - rin2) * 255 / (r2 - rin2);
-                } else k = 1;
+                } else idx = Bb[x];
             } else {
-                k = row_revealed ? 0 : 1;
+                idx = row_revealed ? F[x] : Bb[x];
             }
-            int idx = rc[k][x];
             if (!idx) { o[x] = S.bg_row[y]; continue; }
-            int h = idx & 127;
-            int ddx = (rc[k][x + 1] & 127) - (rc[k][x - 1] & 127);
-            int ddy = (rd[k][x] & 127) - (ru[k][x] & 127);
-            int s = R[((x * 7 + ubase) >> 4) + ROFF0 + LT.roff] - ((ddx * lx + ddy * ly) >> 8);
-            int xs = x + shx;
-            if (xs >= 0 && xs < SCR_W) {
-                int hs = rs[k][xs] & 127;
-                if (hs > h + 3) s -= (hs - h) >> 1;
-            }
-            if (idx & 128) {
-                s -= 15;            /* groove floors catch less light: keeps the lettering legible */
-                if (silkrow) {
-                    int dx = x - rcx;
-                    if (dx * dx + dyc * dyc < silk_r2) s += ((tri256(x * LT.silk_ca + sbase) - 255) * LT.silk_amp) >> 8;
-                }
-            }
+            int s = idx & 127;
             if (gl) {
                 int gi = ((x * gx + gbase) * 6554) >> 16;   /* /10 */
                 if (gi >= 0 && gi < GL_N) s += (idx & 128) ? S.glint[gi] >> 2 : S.glint[gi];
@@ -734,9 +666,7 @@ static void render_metal_k(strip_t *st, const uint8_t *buf, const uint16_t *lut,
                 int hh = hot * hotk >> 8;
                 c = add565(c, hh, hh * 6 / 10, hh / 5);
             }
-            if (zi && zg) {
-                /* molten metal in the letters (fading as they melt), plus a thin molten
-                   sheen over the whole zone while it is being re-cast */
+            if (zi) {
                 int ink = zi[x] * zma >> 8;
                 int xt = x < 40 ? (x - 18) * 12 : (x > 130 ? (152 - x) * 12 : 256);
                 if (xt < 0) xt = 0;
@@ -746,8 +676,6 @@ static void render_metal_k(strip_t *st, const uint8_t *buf, const uint16_t *lut,
             }
             o[x] = c;
         }
-        o[0] = S.bg_row[y];
-        o[SCR_W - 1] = S.bg_row[y];
     }
 }
 
@@ -1202,7 +1130,7 @@ static void row_lr(strip_t *st, int y, const char *l, const char *r, uint16_t rc
 
 static void render_enamel(strip_t *st)
 {
-    if (S.base) render_metal_k(st, S.base, S.lut_back, false, 1);
+    if (S.base) render_metal(st, S.base, S.lut_back, false);
     const float X0 = PANEL_X0, X1 = PANEL_X1, Y0 = PANEL_Y0, Y1 = PANEL_Y1, R = 9;
     for (int yy = 0; yy < st->h; yy++) {
         int y = st->y0 + yy;
@@ -1256,7 +1184,8 @@ static void page_line(strip_t *st, int a, int yo)
     char s1[48];
     text_draw_centered(st, &font_caps13, S.header, cx, 38 + yo, 2.4f, C_GOLD_DIM, a);
     hairline_d(st, 50 + yo, a);
-    float pos = S.burin ? S.burin_pos : (float)S.nchars + 3;
+    /* while turning toward a new line the page stays blank (burin_pos < 0) */
+    float pos = (S.burin || S.burin_pos < 0) ? S.burin_pos : (float)S.nchars + 3;
     for (int i = 0; i < S.nql; i++) {
         int base = S.ql[i].y + yo;
         if (base - 20 > st->y0 + st->h || base + 8 < st->y0) continue;
@@ -1523,8 +1452,7 @@ static void render_zoom(strip_t *st)
                 uint16_t cc;
                 if (tex && src_y >= 0 && src_y < SCR_H && src_x[x] >= 0 && src_x[x] < SCR_W) {
                     int id = S.front[src_y * SCR_W + src_x[x]];
-                    int hs = (id & 127) - 25;
-                    cc = id ? S.lut_front[(id & 128) | (hs < 1 ? 1 : hs)] : bg;
+                    cc = id ? S.lut_front[id] : bg;
                     if (!you) {
                         uint32_t h = hash32((uint32_t)cell_x[x] * 73856093u ^ (uint32_t)cell_y * 19349663u);
                         cc = scale565(cc, 120 + (h & 31));
@@ -1801,24 +1729,12 @@ void scene_tick(float dt, const input_t *in)
 
     bool act = in->shake || in->touch || in->btn_short;
 
-    /* ---- tilt → light. Light only re-renders when it actually moves. */
+    /* ---- tilt: only used to notice the bar being picked up */
     {
         float ax = in->tilt_valid ? in->tilt_x : 0, ay = in->tilt_valid ? in->tilt_y : 0;
-        if (tu->tilt_swap) { float t = ax; ax = ay; ay = t; }
-        if (tu->tilt_flip_x) ax = -ax;
-        if (tu->tilt_flip_y) ay = -ay;
-        ax *= tu->tilt_gain;
-        ay *= tu->tilt_gain;
         float k = clampf(dt / 0.09f, 0, 1);
         S.tx += (ax - S.tx) * k;
         S.ty += (ay - S.ty) * k;
-        S.drift += dt * tu->desk_drift * 0.2f;
-        bool moved = fabsf(S.tx - S.tx_applied) > 0.004f || fabsf(S.ty - S.ty_applied) > 0.004f || tu->desk_drift > 0;
-        if (moved || !LT.key) {
-            S.tx_applied = S.tx;
-            S.ty_applied = S.ty;
-            light_update(S.tx, S.ty, tu->silk, tu->shadow_px, S.drift);
-        }
         float dmove = fabsf(S.tx - S.ref_tx) + fabsf(S.ty - S.ref_ty);
         if (dmove > 0.12f) {
             if (S.still_t > 45 && S.st == ST_FACES && !S.flipping) glint_start(0.9f, 26, 22, 6, 8, 0);

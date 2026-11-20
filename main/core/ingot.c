@@ -41,31 +41,110 @@ static float bar_sdf(float x, float y, float *nx, float *ny)
 
 /* Height map of a blank bar: rounded bevel up to a flat plateau, with a fine
  * sand texture (front) or horizontal brushing (back). Lighting happens at render time. */
+/* Height of the blank bar at one pixel (bit 7 = recessed). Pure function, so the
+ * front and the living zone can be built without keeping a base buffer around. */
+int ingot_base_h(int x, int y, uint32_t seed, int back)
+{
+    float nx, ny;
+    float d = -bar_sdf(x + 0.5f, y + 0.5f, &nx, &ny);   /* + inside */
+    if (d < -0.5f) return 0;
+    float cov = clampf(d + 0.5f, 0, 1);
+    float h;
+    bool rec = false;
+    if (d < BAR_BEVEL) {
+        h = 4 + (PLATEAU - 4) * (d / BAR_BEVEL);             /* flat 45-degree chamfer, sharp ridge */
+    } else {
+        h = PLATEAU;
+        float g = 1 - fabsf(d - FRAME_IN) / 1.1f;            /* fine engraved frame inside the ridge */
+        if (g > 0) { h -= 14 * g; rec = g > 0.5f; }
+    }
+    if (back) h += (vnoise1(y * 0.9f, seed) - 0.5f) * 2.4f + (vnoise1(y * 3.1f, seed ^ 77) - 0.5f) * 1.6f;
+    h += ((hash32(x * 7919 + y * 104729 + seed) & 255) / 255.0f - 0.5f) * (back ? 0.8f : 1.1f);
+    h *= cov;
+    int v = (int)(h + 0.5f);
+    if (v < 1) v = 1;
+    if (v > 127) v = 127;
+    return v | (rec ? IG_RECESS : 0);
+}
+
 void ingot_gen_base(uint8_t *buf, uint32_t seed, int back)
 {
-    for (int y = 0; y < SCR_H; y++) {
-        float streak = back ? (vnoise1(y * 0.9f, seed) - 0.5f) * 2.4f + (vnoise1(y * 3.1f, seed ^ 77) - 0.5f) * 1.6f : 0;
+    for (int y = 0; y < SCR_H; y++)
+        for (int x = 0; x < SCR_W; x++) buf[y * SCR_W + x] = (uint8_t)ingot_base_h(x, y, seed, back);
+}
+
+/* ------------------------------------------------------------------ baking
+ * Light the height map once, from a fixed upper light, into shade indices
+ * (bit 7 = recessed, 1..127 = brightness). Rendering is then a palette lookup. */
+
+#define RN 600
+static int16_t BR[2][RN];
+static bool br_ok;
+
+static void bake_tables(void)
+{
+    if (br_ok) return;
+    for (int i = 0; i < RN; i++) {
+        float u = (float)i - 93;                 /* the bar held upright, light from above */
+        float g1 = (u - 87) / 40, g2 = (u - 231) / 54, g3 = (u - 343) / 29;
+        BR[0][i] = (int16_t)(40 + 52 * expf(-g1 * g1) + 30 * expf(-g2 * g2) + 12 * expf(-g3 * g3));
+        float b1 = (u - 108) / 58, b2 = (u - 267) / 72;
+        BR[1][i] = (int16_t)(50 + 32 * expf(-b1 * b1) + 20 * expf(-b2 * b2));
+    }
+    br_ok = true;
+}
+
+/* light direction (*512) and cast-shadow offset toward it */
+#define LX (-122)
+#define LY (-496)
+#define SHX 0
+#define SHY (-2)
+
+static inline int bake_px(int x, int y, int h, int idx, int hl, int hr, int hu, int hd, int hs, int kind)
+{
+    int s = BR[kind][(x * 7 + y * 15) >> 4] - (((hr - hl) * LX + (hd - hu) * LY) >> 8);
+    if (hs > h + 3) s -= (hs - h) >> 1;
+    if (idx & 128) s -= 15;
+    if (s < 1) s = 1;
+    if (s > 127) s = 127;
+    return s | (idx & 128);
+}
+
+void ingot_bake_rows(const uint8_t *H, int h_y0, int h_rows, uint8_t *out, int y0, int y1, int kind)
+{
+    bake_tables();
+    #define HAT(xx, yy) (((yy) < h_y0 || (yy) >= h_y0 + h_rows) ? H[((yy) < h_y0 ? 0 : h_rows - 1) * SCR_W + (xx)] : H[((yy) - h_y0) * SCR_W + (xx)])
+    for (int y = y0; y < y1; y++)
         for (int x = 0; x < SCR_W; x++) {
-            float nx, ny;
-            float d = -bar_sdf(x + 0.5f, y + 0.5f, &nx, &ny);   /* + inside */
-            if (d < -0.5f) { buf[y * SCR_W + x] = 0; continue; }
-            float cov = clampf(d + 0.5f, 0, 1);
-            float h;
-            bool rec = false;
-            if (d < BAR_BEVEL) {
-                h = 4 + (PLATEAU - 4) * (d / BAR_BEVEL);             /* flat 45-degree chamfer, sharp ridge */
-            } else {
-                h = PLATEAU;
-                /* a fine engraved frame a few px inside the ridge, like a minted bar */
-                float g = 1 - fabsf(d - FRAME_IN) / 1.1f;
-                if (g > 0) { h -= 14 * g; rec = g > 0.5f; }
-            }
-            h += streak + ((hash32(x * 7919 + y * 104729 + seed) & 255) / 255.0f - 0.5f) * (back ? 0.8f : 1.1f);
-            h *= cov;
-            int v = (int)(h + 0.5f);
-            if (v < 1) v = 1;
-            if (v > 127) v = 127;
-            buf[y * SCR_W + x] = (uint8_t)(v | (rec ? IG_RECESS : 0));
+            int idx = HAT(x, y);
+            uint8_t *o = &out[(y - y0) * SCR_W + x];
+            if (!idx) { *o = 0; continue; }
+            int xl = x > 0 ? x - 1 : x, xr = x < SCR_W - 1 ? x + 1 : x;
+            int xs = x + SHX < 0 ? 0 : (x + SHX >= SCR_W ? SCR_W - 1 : x + SHX);
+            *o = (uint8_t)bake_px(x, y, idx & 127, idx, HAT(xl, y) & 127, HAT(xr, y) & 127,
+                                  HAT(x, y - 1) & 127, HAT(x, y + 1) & 127, HAT(xs, y + SHY) & 127, kind);
+        }
+    #undef HAT
+}
+
+/* Whole surface, in place: rows above the current one are read from a small ring. */
+void ingot_bake_inplace(uint8_t *buf, int kind)
+{
+    bake_tables();
+    uint8_t ring[4][SCR_W];
+    for (int y = 0; y < SCR_H; y++) {
+        uint8_t *row = &buf[y * SCR_W];
+        const uint8_t *up = y > 0 ? ring[(y - 1) & 3] : row;
+        const uint8_t *sh = y + SHY >= 0 ? (y + SHY < y ? ring[(y + SHY) & 3] : &buf[(y + SHY) * SCR_W]) : row;
+        const uint8_t *dn = y < SCR_H - 1 ? &buf[(y + 1) * SCR_W] : row;
+        memcpy(ring[y & 3], row, SCR_W);
+        const uint8_t *cur = ring[y & 3];
+        for (int x = 0; x < SCR_W; x++) {
+            int idx = cur[x];
+            if (!idx) { row[x] = 0; continue; }
+            int xl = x > 0 ? x - 1 : x, xr = x < SCR_W - 1 ? x + 1 : x;
+            row[x] = (uint8_t)bake_px(x, y, idx & 127, idx, cur[xl] & 127, cur[xr] & 127,
+                                      up[x] & 127, dn[x] & 127, sh[x] & 127, kind);
         }
     }
 }
@@ -232,7 +311,7 @@ static void rosette(uint8_t *ink, float cx, float cy, uint32_t seed)
     }
 }
 
-void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *mr, ingot_layout_t *lay)
+void ingot_gen_front(uint8_t *buf, uint32_t base_seed, const mint_rec_t *mr, ingot_layout_t *lay)
 {
     const purchase_t *p = &mr->p;
     uint8_t *ink = buf;
@@ -280,7 +359,7 @@ void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *mr, in
     /* ---- combine: grooves are cut into the base height; the cartouche is a low dome */
     for (int i = 0, y = 0; y < SCR_H; y++)
         for (int x = 0; x < SCR_W; x++, i++) {
-            int b = base[i];
+            int b = ingot_base_h(x, y, base_seed, 0);
             if (!b) { buf[i] = 0; continue; }
             float h = (float)b;
             float dx = x + 0.5f - rcx, dy = y + 0.5f - rcy;

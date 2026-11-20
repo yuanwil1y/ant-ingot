@@ -28,11 +28,16 @@ typedef struct {
     stamp_band_t bands[6];      /* engraved text bands in the order they are stamped */
 } ingot_layout_t;
 
-/* Blank cast bar. back=1 → brushed reverse side. */
+/* Blank cast bar heights. back=1 → brushed reverse side. */
 void ingot_gen_base(uint8_t *buf, uint32_t seed, int back);
+int ingot_base_h(int x, int y, uint32_t seed, int back);
+
+/* Light height maps once into shade indices (fixed light from above). */
+void ingot_bake_inplace(uint8_t *buf, int kind);
+void ingot_bake_rows(const uint8_t *H, int h_y0, int h_rows, uint8_t *out, int y0, int y1, int kind);
 
 /* Engrave the front (rosette + inscriptions) on top of base. buf receives the result. */
-void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *m, ingot_layout_t *lay);
+void ingot_gen_front(uint8_t *buf, uint32_t base_seed, const mint_rec_t *m, ingot_layout_t *lay);
 
 void ingot_front_layout(ingot_layout_t *lay, bool inscription);
 

@@ -86,6 +86,12 @@ void app_main(void)
         scene_tick(dt, &in);
         uint32_t ev = scene_take_events();
         bool anim = scene_animating() || first;
+        /* the molten letters alone don't need 30 fps */
+        int r0, r1;
+        scene_dirty_rows(&r0, &r1);
+        static int64_t last_partial;
+        if (anim && r0 > 0 && t0 - last_partial < 66000) anim = false;
+        if (anim && r0 > 0) last_partial = t0;
         if (anim) render_frame();
         uint8_t r, g, b;
         scene_led(&r, &g, &b);
