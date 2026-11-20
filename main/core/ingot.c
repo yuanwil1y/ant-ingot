@@ -175,20 +175,8 @@ int us_et_offset(int64_t utc)
     return (utc >= dst_on && utc < dst_off) ? -4 * 3600 : -5 * 3600;
 }
 
-static const char *MON[] = { "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC" };
 
-static void fmt_date(int64_t local, char *out, int cap)
-{
-    int Y, M, D;
-    civil(local / 86400 - (local < 0 && local % 86400), &Y, &M, &D);
-    snprintf(out, cap, "%d %s %d", D, MON[M - 1], Y);
-}
 
-static void fmt_hm(int64_t local, char *out, int cap)
-{
-    int64_t s = ((local % 86400) + 86400) % 86400;
-    snprintf(out, cap, "%02d:%02d", (int)(s / 3600), (int)(s / 60 % 60));
-}
 
 static const char *NUMW[] = { "ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE", "TEN" };
 
@@ -287,29 +275,7 @@ void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *mr, in
     ink_seg(ink, 94, 226.5f, 142, 226.5f, 0.9f);
     ink_diamond(ink, 85, 226.5f, 2.6f);
 
-    /* price */
-    char price[24];
-    snprintf(price, sizeof price, "$%.2f", p->price);
-    ink_text(ink, &font_caps26, price, cx, 258, 1.0f);
-
-    /* date and time */
-    char date[24], hm[8], hm_et[8];
-    int64_t bj = p->buy_ts + LOCAL_UTC_OFFSET, et = p->buy_ts + us_et_offset(p->buy_ts);
-    fmt_date(bj, date, sizeof date);
-    fmt_hm(bj, hm, sizeof hm);
-    fmt_hm(et, hm_et, sizeof hm_et);
-    ink_text(ink, &font_caps13, date, cx, 279, 2.0f);
-    {
-        char l[16], r[16];
-        snprintf(l, sizeof l, "%s BJT", hm);
-        snprintf(r, sizeof r, "%s ET", hm_et);
-        int wl = text_width(&font_caps11, l, 0.8f), wr = text_width(&font_caps11, r, 0.8f);
-        int gap = 14, x0 = cx - (wl + gap + wr) / 2;
-        inktx_t c = { ink, 1.0f };
-        text_walk(&font_caps11, l, x0, 294, 0.8f, 0, SCR_H, ink_text_px, &c);
-        text_walk(&font_caps11, r, x0 + wl + gap, 294, 0.8f, 0, SCR_H, ink_text_px, &c);
-        ink_diamond(ink, x0 + wl + gap / 2.0f, 290, 1.8f);
-    }
+    /* price and gold weight are not engraved here: they live in the zone (ingot_ink_zone) */
 
     /* ---- combine: grooves are cut into the base height; the cartouche is a low dome */
     for (int i = 0, y = 0; y < SCR_H; y++)
@@ -338,8 +304,8 @@ void ingot_front_layout(ingot_layout_t *lay, bool inscription)
     stamp_band_t b[] = {
         { 24, 60, 0, 0.8f },     /* ANTHROPIC / NASDAQ ANT */
         { 200, 231, 0, 0.8f },   /* ONE SHARE + separator */
-        { 232, 263, 0, 1.4f },   /* price: the heavy blow */
-        { 264, 299, 0, 0.9f },   /* date + time */
+        { ZONE_Y0, ZONE_PRICE_Y1, 0, 1.4f },        /* price: the heavy blow */
+        { ZONE_PRICE_Y1 + 1, ZONE_Y1, 0, 0.9f },    /* gold weight */
     };
     lay->nbands = 4;
     memcpy(lay->bands, b, sizeof b);
@@ -541,4 +507,27 @@ mkt_t market_state(int64_t utc, int64_t *next_open, int64_t *close_at)
         *next_open = d * 86400 + 570 * 60 - off;
     }
     return s;
+}
+
+typedef struct { uint8_t *ink; int z0; } zctx_t;
+static void zink_px(void *c, int x, int y, int a, int ci)
+{
+    (void)ci;
+    zctx_t *z = c;
+    int r = y - z->z0;
+    if ((unsigned)x >= SCR_W || r < 0 || r >= ZONE_H) return;
+    int v = a * 17;
+    uint8_t *p = &z->ink[r * SCR_W + x];
+    if (v > *p) *p = (uint8_t)v;
+}
+
+void ingot_ink_zone(uint8_t *ink, const char *line1, const char *line2)
+{
+    memset(ink, 0, ZONE_H * SCR_W);
+    zctx_t c = { ink, ZONE_Y0 };
+    const int cx = SCR_W / 2;
+    if (line1 && line1[0])
+        text_walk(&font_caps26, line1, cx - text_width(&font_caps26, line1, 1.0f) / 2.0f, ZONE_PRICE_BASE, 1.0f, 0, SCR_H, zink_px, &c);
+    if (line2 && line2[0])
+        text_walk(&font_caps11, line2, cx - text_width(&font_caps11, line2, 1.4f) / 2.0f, ZONE_GOLD_BASE, 1.4f, 0, SCR_H, zink_px, &c);
 }

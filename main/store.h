@@ -16,3 +16,4 @@ void store_save_creds(const creds_t *c);
 void store_save_tune(const tune_t *t);
 void store_save_line(const char *line, int day);
 void store_save_int(const char *key, int v);
+void store_save_assay(const assay_t *a);

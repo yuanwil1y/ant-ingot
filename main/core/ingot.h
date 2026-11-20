@@ -36,6 +36,16 @@ void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *m, ing
 
 void ingot_front_layout(ingot_layout_t *lay, bool inscription);
 
+/* The living zone under the rule: price and gold weight, re-cut at every close. */
+#define ZONE_Y0 236
+#define ZONE_Y1 292
+#define ZONE_H (ZONE_Y1 - ZONE_Y0 + 1)
+#define ZONE_PRICE_Y1 268
+#define ZONE_PRICE_BASE 263
+#define ZONE_GOLD_BASE 285
+#define GROOVE_DEPTH 20
+void ingot_ink_zone(uint8_t *ink, const char *line1, const char *line2);
+
 /* US/Eastern UTC offset (seconds) and the regular/extended session at a UTC instant */
 int us_et_offset(int64_t utc);
 typedef enum { MKT_CLOSED = 0, MKT_PRE, MKT_OPEN, MKT_AFTER } mkt_t;

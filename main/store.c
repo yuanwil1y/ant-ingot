@@ -30,6 +30,9 @@ void store_load(model_t *m, creds_t *c)
     size_t n = sizeof m->mint;
     mint_rec_t r;
     if (nvs_get_blob(h, "mint", &r, &n) == ESP_OK && n == sizeof r) m->mint = r;
+    assay_t as;
+    n = sizeof as;
+    if (nvs_get_blob(h, "assay", &as, &n) == ESP_OK && n == sizeof as) m->assay = as;
     purchase_t p;
     n = sizeof p;
     if (nvs_get_blob(h, "pend", &p, &n) == ESP_OK && n == sizeof p) m->setup.pending = p;
@@ -61,6 +64,7 @@ static void put_blob(const char *k, const void *d, size_t n)
 
 void store_save_mint(const mint_rec_t *r) { put_blob("mint", r, sizeof *r); }
 void store_save_pending(const purchase_t *p) { put_blob("pend", p, sizeof *p); }
+void store_save_assay(const assay_t *a) { put_blob("assay", a, sizeof *a); }
 
 void store_save_tune(const tune_t *t)
 {

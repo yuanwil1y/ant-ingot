@@ -23,6 +23,7 @@ enum {
     EV_LINE_SEEN = 2,       /* model->line_seen_day updated */
     EV_PATINA_SEEN = 4,     /* model->patina_day updated */
     EV_ACTIVITY = 8,        /* user did something (wake backlight) */
+    EV_ASSAY = 16,          /* model->assay changed: persist it */
 };
 
 bool scene_init(model_t *m);            /* allocates buffers, generates surfaces */
@@ -31,6 +32,7 @@ void scene_render(strip_t *st);
 void scene_led(uint8_t *r, uint8_t *g, uint8_t *b);
 uint32_t scene_take_events(void);
 bool scene_animating(void);             /* false → frame is static, rendering can pause */
+void scene_dirty_rows(int *y0, int *y1); /* rows that need redrawing this frame (whole screen by default) */
 void scene_invalidate(void);            /* model changed: render at least one frame */
 void scene_rehearse(void);              /* replay heating + minting without touching data */
 

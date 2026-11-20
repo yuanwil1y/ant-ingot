@@ -41,8 +41,9 @@ int main(int argc, char **argv)
     M.line_day = 1;
     bool market = !strcmp(script, "market");
     bool tilt = !strcmp(script, "tilt");
-    bool minted_start = !strcmp(script, "faces") || market || tilt;
-    if (market || tilt) {
+    bool assay = !strcmp(script, "assay");
+    bool minted_start = !strcmp(script, "faces") || market || tilt || assay;
+    if (market || tilt || assay) {
         M.setup.pending.price = 88.00; M.setup.pending.buy_ts = 1795185000;
         snprintf(M.setup.pending.inscription, sizeof M.setup.pending.inscription, "FOR THE LONG RUN.");
         M.now = 1795185000 + 13200;
@@ -56,6 +57,12 @@ int main(int argc, char **argv)
         }
         if (f) fclose(f);
         M.intra.rev = M.daily.rev = 1;
+        M.quote.valid = 1;
+        M.quote.gold = 3520.48;
+        M.quote.total_shares = 13086672591.0;
+        M.quote.fetched_ts = M.now;
+        snprintf(M.quote.when, sizeof M.quote.when, "2026-11-20 13:10:00");
+        M.assay = (assay_t){ .valid = 1, .price = 88.00, .grams = 0.7522, .close_day = 0 };
         M.line_day = 1;
     }
     if (minted_start) { M.mint.minted = 1; M.mint.p = M.setup.pending; M.patina_day = 1; }
@@ -63,7 +70,7 @@ int main(int argc, char **argv)
     const float dt = 1.0f / 30;
     float t = 0;
     int nframes = 0;
-    float end = tilt ? 14 : (market ? 16 : (minted_start ? 30 : 46));
+    float end = assay ? 12 : (tilt ? 14 : (market ? 16 : (minted_start ? 30 : 46)));
     while (t < end) {
         input_t in = { 0 };
         if (!minted_start) {
@@ -77,6 +84,21 @@ int main(int argc, char **argv)
             if (t >= 5.5f && M.setup.stage != SETUP_READY && !M.mint.minted) M.setup.stage = SETUP_READY;
             /* shaking from 7.5s for ~2s, with a pause in the middle */
             if (t > 7.5f && t < 10.2f && !(t > 8.4f && t < 8.8f)) in.shake_energy = 1.4f + 0.4f * sinf(t * 9);
+        }
+        if (assay) {
+            /* market open: the letters glow; then the close arrives and the bar is weighed */
+            in.tilt_valid = 1; in.tilt_x = 0.1f * sinf(t * 0.7f); in.tilt_y = 0.85f;
+            if (t >= 4.5f && M.now < 1795185000 + 23800) {
+                M.now = 1795185000 + 23800;
+                M.quote.price = 84.78; M.quote.fetched_ts = M.now;
+                snprintf(M.quote.when, sizeof M.quote.when, "2026-11-20 16:00:01");
+            }
+            M.quote.fetched_ts = M.now;
+            scene_tick(dt, &in);
+            scene_take_events();
+            frame(stdout, scale);
+            t += dt;
+            continue;
         }
         if (tilt) {
             /* held upright, a slow wrist wobble, then laid flat on the desk, then the back */
@@ -94,8 +116,9 @@ int main(int argc, char **argv)
             continue;
         }
         if (market) {
-            if (fabsf(t - 1.0f) < dt / 2 || fabsf(t - 3.5f) < dt / 2) in.shake = 1;
-            if ((t > 7.0f && t < 7.1f) || (t > 10.0f && t < 10.1f) || (t > 13.0f && t < 13.1f)) { in.touch = 1; in.tx = 85; in.ty = 160; }
+            M.quote.fetched_ts = M.now;
+            if (fabsf(t - 1.0f) < dt / 2 || fabsf(t - 14.5f) < dt / 2) in.shake = 1;
+            if ((t > 7.5f && t < 7.6f) || (t > 11.0f && t < 11.1f)) { in.touch = 1; in.tx = 85; in.ty = 160; }
             scene_tick(dt, &in);
             scene_take_events();
             frame(stdout, scale);

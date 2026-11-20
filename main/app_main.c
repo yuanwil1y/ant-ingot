@@ -21,8 +21,11 @@ static SemaphoreHandle_t L;
 static void render_frame(void)
 {
     static int which;
+    int r0, r1;
+    scene_dirty_rows(&r0, &r1);
     for (int y = 0; y < SCR_H; y += STRIP_H) {
         int h = SCR_H - y < STRIP_H ? SCR_H - y : STRIP_H;
+        if (y + h <= r0 || y >= r1) continue;          /* this strip did not change */
         hw_lcd_wait(which);
         strip_t st = { hw_lcd_strip_buf(which), y, h };
         scene_render(&st);
@@ -87,6 +90,7 @@ void app_main(void)
         uint8_t r, g, b;
         scene_led(&r, &g, &b);
         mint_rec_t mint = M.mint;
+        assay_t assay = M.assay;
         int seen = M.line_seen_day, patina = M.patina_day, bright = M.tune.brightness;
         xSemaphoreGive(L);
         hw_led_set(r, g, b);
@@ -97,6 +101,7 @@ void app_main(void)
             net_on_minted();
             ESP_LOGI(TAG, "minted");
         }
+        if (ev & EV_ASSAY) store_save_assay(&assay);
         if (ev & EV_LINE_SEEN) store_save_int("seen_day", seen);
         if (ev & EV_PATINA_SEEN) store_save_int("patina_day", patina);
         if (ev & EV_ACTIVITY) last_act = t0;

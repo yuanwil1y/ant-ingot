@@ -12,7 +12,7 @@
 #define GL_N 420
 
 enum { ST_SETUP, ST_READY, ST_MINT, ST_FACES, ST_ZOOM };
-enum { F_FRONT, F_LINE, F_LEDGER, F_COUNT };
+enum { F_FRONT, F_BACK, F_COUNT };
 
 /* palette helpers */
 #define C_INK      rgb565(46, 36, 22)
@@ -47,7 +47,6 @@ static struct {
     float t;                    /* time in current state */
     float clock;                /* monotonic seconds */
     const uint8_t *base, *front;
-    uint8_t *back;
     ingot_layout_t lay;
     uint16_t lut_front[256], lut_back[256];
     metal_params_t mp_front, mp_back;
@@ -92,16 +91,27 @@ static struct {
     bool need_calm;
     float calm_t;
 
-    /* line face */
+    /* living zone on the front: price + gold weight, re-cut at each close */
+    uint8_t *zink_a, *zink_b;   /* ZONE_H x SCR_W text masks: shown / incoming */
+    uint8_t *zbuf;              /* heights of rows ZONE_Y0-1 .. ZONE_Y1+1 */
+    float zm_a, zm_b1, zm_b2;   /* how deep each mask is cut (0 = melted flat) */
+    float zflash[2];
+    int as_phase;               /* 0 idle, 1 holding after mint, 2 assaying */
+    float as_t, as_wait;
+    assay_t as_new;
+    float furnace;              /* 0..1 market-open glow */
+    float zglow;                /* current glow strength 0..1 */
+    int zglow_r, zglow_g, zglow_b;
+    float zscroll;
+
+    /* back, page 0: the daily line */
     char line[160];
     int line_for_day;
     qline_t ql[8];
     int nql, nchars;
     bool burin;
-    float burin_pos;            /* characters engraved (float) */
-    int burin_done;
-    char header[40], footer[40];
-    bool back_built;
+    float burin_pos;            /* characters revealed (float) */
+    char header[40];
 
     /* ledger / market face */
     int mpage, mpage_to;
@@ -135,6 +145,7 @@ static struct {
     bool sweeping;
     int sweep_from_day;
 
+    bool partial;               /* only the zone needs redrawing */
     float fade;                 /* boot fade-in */
     uint32_t events;
     bool dirty;
@@ -236,12 +247,19 @@ static void date_of(int64_t utc, char *out, int cap)
     snprintf(out, cap, "%u %s %d", d, MONS[mo - 1], y);
 }
 
+static int32_t ymd_to_days_s(int ymd)
+{
+    int y = ymd / 10000, m = ymd / 100 % 100, d = ymd % 100;
+    y -= m <= 2;
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int)doe - 719468;
+}
+
 /* ================================================================== surfaces */
 
-static uint32_t seed_of(const purchase_t *p)
-{
-    return hash32((uint32_t)(p->price * 100 + 0.5) ^ (uint32_t)p->buy_ts);
-}
 
 static void build_band_rows(void)
 {
@@ -296,10 +314,12 @@ static const char *current_line(int day)
     return FALLBACK_LINES[(day > 0 ? day : 0) % N_FALLBACK];
 }
 
+#define QL_MID 116
+
 static void layout_line(const char *txt)
 {
     const font_t *f = &font_ital17;
-    const int maxw = 136;
+    const int maxw = 128;
     S.nql = 0;
     S.nchars = 0;
     char word[48];
@@ -324,8 +344,8 @@ static void layout_line(const char *txt)
         }
     }
     if (cur[0] && S.nql < 8) { snprintf(S.ql[S.nql].s, sizeof S.ql[0].s, "%s", cur); S.nql++; }
-    const int lh = 23;
-    int top = 168 - (S.nql * lh) / 2 + 12;
+    const int lh = 22;
+    int top = QL_MID - (S.nql * lh) / 2 + 15;
     for (int i = 0; i < S.nql; i++) {
         S.ql[i].x = SCR_W / 2.0f - text_width(f, S.ql[i].s, 0.2f) / 2.0f;
         S.ql[i].y = top + i * lh;
@@ -333,15 +353,6 @@ static void layout_line(const char *txt)
         S.ql[i].n = (int)strlen(S.ql[i].s);
         S.nchars += S.ql[i].n;
     }
-}
-
-static void engrave_char(int k)
-{
-    for (int i = 0; i < S.nql; i++)
-        if (k >= S.ql[i].first && k < S.ql[i].first + S.ql[i].n) {
-            ingot_engrave_text(S.back, &font_ital17, S.ql[i].s, S.ql[i].x, S.ql[i].y, 0.2f, k - S.ql[i].first);
-            return;
-        }
 }
 
 static void char_pos(float k, float *x, float *y)
@@ -359,34 +370,202 @@ static void char_pos(float k, float *x, float *y)
             *y = S.ql[i].y - 5;
             return;
         }
-    *x = SCR_W / 2.0f; *y = 170;
+    *x = SCR_W / 2.0f; *y = QL_MID;
 }
 
-static void build_back(bool engraved)
+static void prepare_line(void)
 {
-    if (!S.back) S.back = malloc(SCR_W * SCR_H);
-    if (!S.back) return;
     int day = days_held(S.m);
-    ingot_gen_base(S.back, seed_of(&S.m->mint.p) ^ 0xBAC4, 1);
     char r[24];
     if (day > 0) snprintf(S.header, sizeof S.header, "DAY %s", roman(day, r, sizeof r));
     else snprintf(S.header, sizeof S.header, "HELD");
-    int w = text_width(&font_caps13, S.header, 2.4f);
-    ingot_engrave_text(S.back, &font_caps13, S.header, SCR_W / 2.0f - w / 2.0f, 40, 2.4f, -1);
-    /* hairline with a diamond, engraved as text-ish strokes */
-    ingot_engrave_rule(S.back, 50, 120, 56);
-    if (S.m->now > 0) date_of(S.m->now, S.footer, sizeof S.footer);
-    else snprintf(S.footer, sizeof S.footer, "ANT");
-    w = text_width(&font_caps11, S.footer, 1.6f);
-    ingot_engrave_text(S.back, &font_caps11, S.footer, SCR_W / 2.0f - w / 2.0f, 290, 1.6f, -1);
     snprintf(S.line, sizeof S.line, "%s", current_line(day));
     S.line_for_day = day;
     layout_line(S.line);
-    if (engraved)
-        for (int k = 0; k < S.nchars; k++) engrave_char(k);
-    S.burin_done = engraved ? S.nchars : 0;
-    S.burin_pos = (float)S.burin_done;
-    S.back_built = true;
+}
+
+static bool line_is_stale(void)
+{
+    int d = days_held(S.m);
+    return d != S.line_for_day || strcmp(S.line, current_line(d)) != 0;
+}
+
+/* ---------------------------------------------------------------- living zone */
+
+static uint8_t NOISE[64][64];
+
+static void build_noise(void)
+{
+    for (int y = 0; y < 64; y++)
+        for (int x = 0; x < 64; x++) {
+            /* two octaves of tileable value noise */
+            float v = 0, amp = 0.65f;
+            for (int o = 0; o < 2; o++) {
+                int per = o ? 8 : 4;
+                float fx = x * per / 64.0f, fy = y * per / 64.0f;
+                int ix = (int)fx, iy = (int)fy;
+                float ux = fx - ix, uy = fy - iy;
+                ux = ux * ux * (3 - 2 * ux); uy = uy * uy * (3 - 2 * uy);
+                #define NV(a, b) ((hash32((uint32_t)(((a) % per) * 73 + ((b) % per) * 151 + o * 977)) & 255) / 255.0f)
+                float n = lerpf(lerpf(NV(ix, iy), NV(ix + 1, iy), ux), lerpf(NV(ix, iy + 1), NV(ix + 1, iy + 1), ux), uy);
+                #undef NV
+                v += n * amp;
+                amp = 0.35f;
+            }
+            NOISE[y][x] = (uint8_t)(v * 255);
+        }
+}
+
+static void zone_texts(double price, double grams, char *l1, int c1, char *l2, int c2)
+{
+    snprintf(l1, c1, "$%.2f", price);
+    if (grams > 0) snprintf(l2, c2, grams < 10 ? "%.3f G FINE GOLD" : "%.2f G FINE GOLD", grams);
+    else l2[0] = 0;
+}
+
+static double grams_for(double price)
+{
+    double gold = S.m->quote.gold;
+    int sh = S.m->mint.p.shares > 0 ? S.m->mint.p.shares : 1;
+    return gold > 0 ? price * sh / (gold / TROY_OZ_G) : 0;
+}
+
+static void zbuild(void)
+{
+    if (!S.zbuf || !S.front) return;
+    for (int r = ZONE_Y0 - 1; r <= ZONE_Y1 + 1; r++) {
+        const uint8_t *f = S.front + r * SCR_W;
+        uint8_t *o = S.zbuf + (r - (ZONE_Y0 - 1)) * SCR_W;
+        int zr = r - ZONE_Y0;
+        if (zr < 0 || zr >= ZONE_H) { memcpy(o, f, SCR_W); continue; }
+        int mb = (int)(256 * (r <= ZONE_PRICE_Y1 ? S.zm_b1 : S.zm_b2));
+        int ma = (int)(256 * S.zm_a);
+        const uint8_t *ia = S.zink_a + zr * SCR_W, *ib = S.zink_b + zr * SCR_W;
+        for (int x = 0; x < SCR_W; x++) {
+            if (!f[x]) { o[x] = 0; continue; }
+            int a = ia[x] * ma >> 8, b = ib[x] * mb >> 8;
+            int ink = a > b ? a : b;
+            int h = (f[x] & 127) - GROOVE_DEPTH * ink / 255;
+            if (h < 1) h = 1;
+            o[x] = (uint8_t)(h | ((f[x] & 128) || ink > 107 ? 128 : 0));
+        }
+    }
+}
+
+static bool zone_alloc(void)
+{
+    if (!S.zink_a) S.zink_a = calloc(ZONE_H, SCR_W);
+    if (!S.zink_b) S.zink_b = calloc(ZONE_H, SCR_W);
+    if (!S.zbuf) S.zbuf = calloc(ZONE_H + 2, SCR_W);
+    return S.zink_a && S.zink_b && S.zbuf;
+}
+
+/* Show a weighing immediately (no ceremony). */
+static void zone_show(double price, double grams)
+{
+    if (!zone_alloc()) return;
+    char l1[16], l2[28];
+    zone_texts(price, grams, l1, sizeof l1, l2, sizeof l2);
+    ingot_ink_zone(S.zink_a, l1, l2);
+    memset(S.zink_b, 0, ZONE_H * SCR_W);
+    S.zm_a = 1;
+    S.zm_b1 = S.zm_b2 = 0;
+    zbuild();
+}
+
+/* The latest official close we know of, as an ET day index. */
+static bool latest_close(int32_t *day)
+{
+    const quote_t *q = &S.m->quote;
+    if (!q->valid || strlen(q->when) < 16) return false;
+    if (S.m->now > 0 && q->fetched_ts > 0 && S.m->now - q->fetched_ts > 1800) return false;
+    int Y = atoi(q->when), Mo = atoi(q->when + 5), D = atoi(q->when + 8);
+    int hh = atoi(q->when + 11), mi = atoi(q->when + 14);
+    if (hh * 60 + mi < 9 * 60 + 30) return false;
+    int32_t d = ymd_to_days_s(Y * 10000 + Mo * 100 + D);
+    /* give the official close a few minutes to settle before weighing it */
+    if (S.m->now > 0) {
+        int64_t et = S.m->now + us_et_offset(S.m->now);
+        if (et / 86400 == d && (et % 86400) < 16 * 3600 + 5 * 60) return false;
+    }
+    /* only closes after the purchase count */
+    int64_t close_utc = (int64_t)d * 86400 + (hh * 60 + mi) * 60;
+    close_utc -= us_et_offset(close_utc);
+    if (close_utc <= S.m->mint.p.buy_ts) return false;
+    *day = d;
+    return true;
+}
+
+static void start_assay(int32_t day)
+{
+    double price = S.m->quote.price;
+    double grams = grams_for(price);
+    S.as_new = (assay_t){ .valid = true, .price = price, .grams = grams, .close_day = day };
+    char l1[16], l2[28];
+    zone_texts(price, grams, l1, sizeof l1, l2, sizeof l2);
+    ingot_ink_zone(S.zink_b, l1, l2);
+    S.zm_b1 = S.zm_b2 = 0;
+    S.as_phase = 2;
+    S.as_t = 0;
+    S.as_wait = 0;
+}
+
+static void zone_tick(float dt)
+{
+    model_t *m = S.m;
+    if (!S.zbuf) return;
+    mkt_t ms = m->now > 0 ? market_state(m->now, NULL, NULL) : MKT_CLOSED;
+    if (S.as_phase == 1) { S.as_t += dt; if (S.as_t >= 3.0f) { S.as_phase = 0; S.as_t = 0; } }
+
+    /* a close we have not weighed yet → the ceremony (waits briefly for a gold price) */
+    if (S.as_phase == 0 && ms != MKT_OPEN && !S.flipping && S.st == ST_FACES) {
+        int32_t d;
+        if (latest_close(&d) && (!m->assay.valid || d > m->assay.close_day)) {
+            if (m->quote.gold > 0 || S.as_wait > 90) start_assay(d);
+            else S.as_wait += dt;
+        }
+    }
+    float target = (S.as_phase == 0 && ms == MKT_OPEN && m->quote.valid) ? 1.0f : 0.0f;
+    S.furnace += (target - S.furnace) * clampf(dt / 0.9f, 0, 1);
+    if (S.furnace < 0.003f && target == 0) S.furnace = 0;
+
+    float melt = 0;
+    if (S.as_phase == 2) {
+        float t = (S.as_t += dt);
+        S.zm_a = 1 - smoothstep01(t / 0.9f);
+        melt = sinf(PI * clampf(t / 1.05f, 0, 1));
+        if (t >= 1.05f && S.zm_b1 < 1) { S.zm_b1 = 1; S.zflash[0] = 1; S.dyv += 70 * 1.4f; S.led_pulse = 1.0f; }
+        if (t >= 1.25f && S.zm_b2 < 1) { S.zm_b2 = 1; S.zflash[1] = 1; S.dyv += 70 * 0.8f; S.led_pulse = fmaxf(S.led_pulse, 0.7f); }
+        if (t >= 1.5f && t - dt < 1.5f) glint_start(0.7f, 36, 20, 6, 8, 0);
+        if (t >= 2.4f) {
+            memcpy(S.zink_a, S.zink_b, ZONE_H * SCR_W);
+            S.zm_a = 1;
+            S.zm_b1 = S.zm_b2 = 0;
+            m->assay = S.as_new;
+            S.events |= EV_ASSAY;
+            S.as_phase = 0;
+        }
+        zbuild();
+    }
+    for (int i = 0; i < 2; i++) S.zflash[i] = fmaxf(0, S.zflash[i] - dt / 0.3f);
+    /* stamp jolt (the mint has its own) */
+    if (S.st == ST_FACES && (S.dy != 0 || S.dyv != 0)) {
+        float acc = -1400 * S.dy - 34 * S.dyv;
+        S.dyv += acc * dt;
+        S.dy += S.dyv * dt;
+        if (fabsf(S.dy) < 0.05f && fabsf(S.dyv) < 0.5f) S.dy = S.dyv = 0;
+    }
+    /* glow colour: open → hot when above cost, a dull red when below; melting → bright */
+    float er, eg, eb, k;
+    if (melt > 0) { blackbody(0.7f, &er, &eg, &eb); k = melt; }
+    else {
+        bool up = m->quote.valid && m->quote.price >= m->mint.p.price;
+        blackbody(up ? 0.6f : 0.36f, &er, &eg, &eb);
+        k = S.furnace * 0.62f;
+    }
+    S.zglow = k;
+    S.zglow_r = (int)(er * 255); S.zglow_g = (int)(eg * 255); S.zglow_b = (int)(eb * 255);
+    S.zscroll += dt * 9;
 }
 
 /* ================================================================== renderers */
@@ -445,6 +624,14 @@ static void light_update(float tx, float ty, float silk, float shadow_px, float 
 
 static inline int tri256(int v) { v &= 0xFF; return v < 128 ? v * 2 : (255 - v) * 2; }
 
+static inline const uint8_t *rowp(const uint8_t *buf, int r)
+{
+    if (r < 0) r = 0;
+    if (r >= SCR_H) r = SCR_H - 1;
+    if (buf == S.front && S.zbuf && r >= ZONE_Y0 - 1 && r <= ZONE_Y1 + 1) return S.zbuf + (r - (ZONE_Y0 - 1)) * SCR_W;
+    return buf + r * SCR_W;
+}
+
 static void render_metal_k(strip_t *st, const uint8_t *buf, const uint16_t *lut, bool minting, int kind)
 {
     int dy = (int)lrintf(S.dy);
@@ -468,6 +655,12 @@ static void render_metal_k(strip_t *st, const uint8_t *buf, const uint16_t *lut,
     const int lx = LT.lx, ly = LT.ly, shx = LT.shx, shy = LT.shy;
     const bool silk = kind == 0 && LT.silk_amp > 0 && !minting;
     const int silk_r2 = 58 * 58;
+    const bool zone = buf == S.front && S.zbuf && !minting;
+    const int zg = (int)(S.zglow * 256);
+    const int zs = (int)S.zscroll;
+    const int zma = (int)(256 * S.zm_a);
+    const int zpool = S.as_phase == 2 ? (int)(70 * sinf(PI * clampf(S.as_t / 1.05f, 0, 1))) : 0;
+    const uint8_t *B = (minting && S.base) ? S.base : buf;
     for (int yy = 0; yy < st->h; yy++) {
         int y = st->y0 + yy;
         int sy = y - dy;
@@ -477,39 +670,45 @@ static void render_metal_k(strip_t *st, const uint8_t *buf, const uint16_t *lut,
         int dyc = sy - rcy;
         bool rosrow = minting && dyc * dyc < (int)(S.lay.rmax * S.lay.rmax) + 64;
         bool silkrow = silk && dyc * dyc < silk_r2;
+        int zr = sy - ZONE_Y0;
+        bool zrow = zone && zr >= 0 && zr < ZONE_H;
         int add_row = (minting && band >= 0) ? flash[band] : 0;
+        if (zrow) add_row += (int)(S.zflash[sy <= ZONE_PRICE_Y1 ? 0 : 1] * 40);
         bool row_revealed = !minting || (band >= 0 ? bandt[band] : !rosrow);
-        const uint8_t *F = buf;
-        const uint8_t *B = (minting && S.base) ? S.base : buf;
-        int gbase = sy * gy;
         int sys = sy + shy;
-        if (sys < 0) sys = 0;
-        if (sys >= SCR_H) sys = SCR_H - 1;
+        const uint8_t *rc[2] = { rowp(buf, sy), rowp(B, sy) };
+        const uint8_t *ru[2] = { rowp(buf, sy - 1), rowp(B, sy - 1) };
+        const uint8_t *rd[2] = { rowp(buf, sy + 1), rowp(B, sy + 1) };
+        const uint8_t *rs[2] = { rowp(buf, sys), rowp(B, sys) };
+        const uint8_t *zi = zrow ? S.zink_a + zr * SCR_W : NULL;
+        const uint8_t *nrow = NOISE[(zr + 640 - zs) & 63];
+        /* the molten pool fades out toward the zone's top and bottom */
+        int ptaper = zrow ? (zr < 14 ? zr * 18 : (ZONE_H - 1 - zr < 14 ? (ZONE_H - 1 - zr) * 18 : 256)) : 0;
+        int zpool_row = zpool * ptaper >> 8;
+        int gbase = sy * gy;
         int ubase = sy * 15, sbase = sy * LT.silk_sa + LT.silk_phase;
         for (int x = 1; x < SCR_W - 1; x++) {
-            const uint8_t *src;
+            int k;
             int hot = 0;
             if (rosrow) {
                 int dx = x - rcx;
                 int d2 = dx * dx + dyc * dyc;
                 if (d2 < r2) {
-                    src = F;
+                    k = 0;
                     if (d2 >= rin2 && r2 > rin2) hot = (d2 - rin2) * 255 / (r2 - rin2);
-                } else src = B;
+                } else k = 1;
             } else {
-                src = row_revealed ? F : B;
+                k = row_revealed ? 0 : 1;
             }
-            int i = sy * SCR_W + x;
-            int idx = src[i];
+            int idx = rc[k][x];
             if (!idx) { o[x] = S.bg_row[y]; continue; }
             int h = idx & 127;
-            int ddx = (src[i + 1] & 127) - (src[i - 1] & 127);
-            int ddy = (src[i + SCR_W] & 127) - (src[i - SCR_W] & 127);
+            int ddx = (rc[k][x + 1] & 127) - (rc[k][x - 1] & 127);
+            int ddy = (rd[k][x] & 127) - (ru[k][x] & 127);
             int s = R[((x * 7 + ubase) >> 4) + ROFF0 + LT.roff] - ((ddx * lx + ddy * ly) >> 8);
-            /* a short shadow cast by whatever stands between this pixel and the light */
             int xs = x + shx;
             if (xs >= 0 && xs < SCR_W) {
-                int hs = src[sys * SCR_W + xs] & 127;
+                int hs = rs[k][xs] & 127;
                 if (hs > h + 3) s -= (hs - h) >> 1;
             }
             if (idx & 128) {
@@ -531,6 +730,16 @@ static void render_metal_k(strip_t *st, const uint8_t *buf, const uint16_t *lut,
                 int hh = hot * hotk >> 8;
                 c = add565(c, hh, hh * 6 / 10, hh / 5);
             }
+            if (zi && zg) {
+                /* molten metal in the letters (fading as they melt), plus a thin molten
+                   sheen over the whole zone while it is being re-cast */
+                int ink = zi[x] * zma >> 8;
+                int xt = x < 40 ? (x - 18) * 12 : (x > 130 ? (152 - x) * 12 : 256);
+                if (xt < 0) xt = 0;
+                if (xt > 256) xt = 256;
+                int e = ((ink + (zpool_row * xt >> 8)) * zg >> 8) * (96 + nrow[(x + (zs >> 2)) & 63]) >> 8;
+                if (e) c = add565(c, S.zglow_r * e >> 8, S.zglow_g * e >> 8, S.zglow_b * e >> 8);
+            }
             o[x] = c;
         }
         o[0] = S.bg_row[y];
@@ -540,7 +749,7 @@ static void render_metal_k(strip_t *st, const uint8_t *buf, const uint16_t *lut,
 
 static void render_metal(strip_t *st, const uint8_t *buf, const uint16_t *lut, bool minting)
 {
-    render_metal_k(st, buf, lut, minting, buf == S.back ? 1 : 0);
+    render_metal_k(st, buf, lut, minting, 0);
 }
 
 /* ---------------------------------------------------------------- setup tag */
@@ -663,21 +872,6 @@ static void render_ready_overlay(strip_t *st)
     float pulse = 0.55f + 0.45f * sinf(S.clock * 3.2f);
     text_draw_centered(st, &font_caps13, "SHAKE TO MINT", cx, 220, 1.2f, rgb565(150, 72, 20), (int)(a * pulse));
     text_draw_centered(st, &font_serif13, S.rehearsal ? "nothing will be saved" : "engraving is permanent", cx, 238, 0, C_CARD_DIM, a);
-}
-
-/* ---------------------------------------------------------------- line face */
-
-static void render_line_face(strip_t *st)
-{
-    if (!S.back) { for (int i = 0; i < SCR_W * st->h; i++) st->px[i] = 0; return; }
-    render_metal(st, S.back, S.lut_back, false);
-    if (S.burin && S.burin_done < S.nchars) {
-        float x, y;
-        char_pos(S.burin_pos, &x, &y);
-        float fl = 0.75f + 0.25f * sinf(S.clock * 53) * sinf(S.clock * 31);
-        glow_add(st, x, y, 9, 255, 220, 160, 0.55f * fl);
-        glow_add(st, x, y, 3.2f, 255, 255, 240, 1.0f);
-    }
 }
 
 /* ---------------------------------------------------------------- ledger */
@@ -976,7 +1170,7 @@ static void draw_chart(strip_t *st, int alpha, int yoff)
         int w = text_width(&font_caps11, "YOU", 1.0f);
         float lx = clampf(mx - w / 2.0f, CH_X0, CH_X0 + CH_W - w);
         float lyb = CHT.label_below ? my + 15 : my - 6;
-        if (off_line) text_draw(st, &font_caps11, "YOU", lx, (int)lyb, 1.0f, C_GOLD, alpha);
+        (void)off_line; (void)lx; (void)lyb;
     }
 }
 
@@ -1004,7 +1198,7 @@ static void row_lr(strip_t *st, int y, const char *l, const char *r, uint16_t rc
 
 static void render_enamel(strip_t *st)
 {
-    if (S.back) render_metal(st, S.back, S.lut_back, false);
+    if (S.base) render_metal_k(st, S.base, S.lut_back, false, 1);
     const float X0 = PANEL_X0, X1 = PANEL_X1, Y0 = PANEL_Y0, Y1 = PANEL_Y1, R = 9;
     for (int yy = 0; yy < st->h; yy++) {
         int y = st->y0 + yy;
@@ -1027,22 +1221,84 @@ static void render_enamel(strip_t *st)
     }
 }
 
-static void page_today(strip_t *st, int a, int yo)
+static void hairline_d(strip_t *st, int y, int a)
+{
+    fill_rrect(st, 34, y - 0.5f, 76, y + 0.5f, 0, C_GOLD_DIM, a * 160 >> 8);
+    fill_rrect(st, 94, y - 0.5f, 136, y + 0.5f, 0, C_GOLD_DIM, a * 160 >> 8);
+    draw_seg(st, 85, y - 2.5f, 87.5f, y, 1.2f, C_GOLD_DIM, a);
+    draw_seg(st, 87.5f, y, 85, y + 2.5f, 1.2f, C_GOLD_DIM, a);
+    draw_seg(st, 85, y + 2.5f, 82.5f, y, 1.2f, C_GOLD_DIM, a);
+    draw_seg(st, 82.5f, y, 85, y - 2.5f, 1.2f, C_GOLD_DIM, a);
+}
+
+typedef struct { strip_t *st; int first; float pos; int a; } qdctx_t;
+static void q_px(void *vc, int x, int y, int a15, int ci)
+{
+    qdctx_t *c = vc;
+    if (x < 0 || x >= SCR_W) return;
+    float r = clampf((c->pos - (c->first + ci)) / 2.5f, 0, 1);     /* each letter fades in over ~2.5 letters */
+    int al = (int)(r * c->a);
+    if (!al) return;
+    uint16_t *d = &c->st->px[(y - c->st->y0) * SCR_W + x];
+    *d = blend565(*d, C_GOLD_HI, a15 * al / 15);
+}
+
+/* Back, page 0: today's line, and what has happened since you bought */
+static void page_line(strip_t *st, int a, int yo)
 {
     const quote_t *q = &S.m->quote;
     const purchase_t *p = &S.m->mint.p;
+    int cx = SCR_W / 2;
+    char s1[48];
+    text_draw_centered(st, &font_caps13, S.header, cx, 38 + yo, 2.4f, C_GOLD_DIM, a);
+    hairline_d(st, 50 + yo, a);
+    float pos = S.burin ? S.burin_pos : (float)S.nchars + 3;
+    for (int i = 0; i < S.nql; i++) {
+        int base = S.ql[i].y + yo;
+        if (base - 20 > st->y0 + st->h || base + 8 < st->y0) continue;
+        qdctx_t c = { st, S.ql[i].first, pos, a };
+        text_walk(&font_ital17, S.ql[i].s, S.ql[i].x, base, 0.2f, st->y0, st->y0 + st->h, q_px, &c);
+    }
+    if (S.burin && S.burin_pos < S.nchars) {
+        float x, y;
+        char_pos(S.burin_pos, &x, &y);
+        float fl = 0.75f + 0.25f * sinf(S.clock * 53) * sinf(S.clock * 31);
+        glow_add(st, x, y + yo, 9, 255, 220, 160, 0.5f * fl * a / 256);
+        glow_add(st, x, y + yo, 3, 255, 255, 240, 1.0f * a / 256);
+    }
+    hairline_d(st, 186 + yo, a);
+    text_draw_centered(st, &font_caps11, "SINCE YOU BOUGHT", cx, 206 + yo, 0.4f, C_GOLD_DIM, a);
+    if (q->valid) {
+        double g = (q->price / p->price - 1) * 100;
+        snprintf(s1, sizeof s1, "%+.2f%%", g);
+        text_draw_centered(st, &font_mono32, s1, cx, 242 + yo, 0, g >= 0 ? C_UP : C_DOWN, a);
+        snprintf(s1, sizeof s1, "$%.2f  >  $%.2f", p->price, q->price);
+        text_draw_centered(st, &font_mono11, s1, cx, 260 + yo, 0, C_GOLD_DIM, a);
+    }
+    /* provenance: the moment it began */
+    char d[24];
+    date_of(p->buy_ts, d, sizeof d);
+    int64_t bj = ((p->buy_ts + LOCAL_UTC_OFFSET) % 86400 + 86400) % 86400;
+    snprintf(s1, sizeof s1, "%s  %02d:%02d", d, (int)(bj / 3600), (int)(bj / 60 % 60));
+    text_draw_centered(st, &font_mono11, s1, cx, 280 + yo, 0, rgb565(120, 104, 80), a);
+}
+
+/* Back, page 1: the market, only what matters */
+static void page_market(strip_t *st, int a, int yo)
+{
+    const quote_t *q = &S.m->quote;
     int cx = SCR_W / 2;
     char s1[40], s2[40];
     int64_t now = S.m->now, nopen = 0, close_at = 0;
     mkt_t ms = now > 0 ? market_state(now, &nopen, &close_at) : MKT_CLOSED;
     static const char *MS[] = { "CLOSED", "PRE", "OPEN", "AFTER" };
-    text_draw(st, &font_caps11, "TODAY", 26, 36 + yo, 2.0f, C_GOLD_DIM, a);
+    text_draw(st, &font_caps11, "ANT", 26, 36 + yo, 2.0f, C_GOLD_DIM, a);
     {
         const char *t = MS[ms];
         int w = text_width(&font_caps11, t, 1.6f);
         uint16_t c = ms == MKT_OPEN ? C_GOLD_HI : (ms == MKT_CLOSED ? rgb565(120, 112, 100) : C_GOLD);
-        text_draw(st, &font_caps11, t, 145 - w, 36 + yo, 1.6f, c, a);
-        fill_rrect(st, 145 - w - 9, 30 + yo, 145 - w - 4, 35 + yo, 2.5f, c, a);
+        text_draw(st, &font_caps11, t, 140 - w, 36 + yo, 1.6f, c, a);
+        fill_rrect(st, 140 - w - 9, 30 + yo, 140 - w - 4, 35 + yo, 2.5f, c, a);
     }
     float t = S.ledger_anim ? clampf(S.ledger_t / 0.9f, 0, 1) : (S.ledger_ready ? 0 : 1);
     float e = ease_out_cubic(t);
@@ -1056,127 +1312,47 @@ static void page_today(strip_t *st, int a, int yo)
             text_draw_centered(st, &font_mono32, s2, cx, 80 + yo, 0, C_GOLD_HI, a);
         }
         double chg = S.led_from[1] + (S.led_to[1] - S.led_from[1]) * e;
-        snprintf(s1, sizeof s1, "%+.2f%%   %+.2f", chg, q->price - q->prev_close);
+        snprintf(s1, sizeof s1, "%+.2f%% TODAY", chg);
         text_draw_centered(st, &font_mono11, s1, cx, 99 + yo, 0, chg >= 0 ? C_UP : C_DOWN, a);
     } else {
         text_draw_centered(st, &font_mono32, "$--.--", cx, 80 + yo, 0, C_GOLD_DIM, a);
     }
     if (CHT.ok) draw_chart(st, a, yo);
-    else text_draw_centered(st, &font_mono11, "no session yet", cx, CH_Y0 + CH_H / 2 + yo, 0, C_GOLD_DIM, a);
-    if (q->valid && q->high > q->low) {
-        /* day range */
-        int y = 214 + yo;
-        float u = clampf((float)((q->price - q->low) / (q->high - q->low)), 0, 1);
-        fill_rrect(st, 26, y - 1, 145, y + 1, 1, rgb565(70, 60, 44), a);
-        float cpos = 26 + u * 119;
-        fill_rrect(st, 26, y - 1, cpos, y + 1, 1, C_GOLD_DIM, a);
-        fill_rrect(st, cpos - 2.5f, y - 4, cpos + 2.5f, y + 4, 1.5f, C_GOLD_HI, a);
-        float cu = (float)((p->price - q->low) / (q->high - q->low));
-        if (cu >= 0 && cu <= 1) fill_rrect(st, 26 + cu * 119 - 0.6f, y - 5, 26 + cu * 119 + 0.6f, y + 5, 0, C_GOLD, a);
-        snprintf(s1, sizeof s1, "L %.2f", q->low);
-        snprintf(s2, sizeof s2, "H %.2f", q->high);
-        text_draw(st, &font_mono11, s1, 26, y + 15, 0, C_GOLD_DIM, a);
-        text_draw(st, &font_mono11, s2, 145 - text_width(&font_mono11, s2, 0), y + 15, 0, C_GOLD_DIM, a);
-        fmt_big(q->volume, s2, sizeof s2);
-        row_lr(st, 250 + yo, "VOLUME", s2, C_GOLD, a);
-        snprintf(s2, sizeof s2, "%.2f", q->prev_close);
-        row_lr(st, 265 + yo, "PREV", s2, C_GOLD, a);
+    if (q->valid) {
+        snprintf(s2, sizeof s2, "x%.2f", q->price / IPO_PRICE);
+        row_lr(st, 222 + yo, "SINCE IPO", s2, q->price >= IPO_PRICE ? C_UP : C_DOWN, a);
+        double total = q->total_shares > 1e6 ? q->total_shares : DEFAULT_TOTAL_SHARES;
+        char s3[24];
+        fmt_big(total * q->price, s3, sizeof s3);
+        snprintf(s2, sizeof s2, "$%s", s3);
+        row_lr(st, 240 + yo, "MKT CAP", s2, C_GOLD, a);
     }
     if ((ms == MKT_PRE || ms == MKT_AFTER) && q->ext_price > 0) {
         snprintf(s1, sizeof s1, "%s $%.2f %+.2f%%", ms == MKT_PRE ? "PRE" : "AFTER", q->ext_price, q->ext_pct);
-        text_draw_centered(st, &font_mono11, s1, cx, 281 + yo, 0, q->ext_pct >= 0 ? C_UP : C_DOWN, a);
+        text_draw_centered(st, &font_mono11, s1, cx, 270 + yo, 0, q->ext_pct >= 0 ? C_UP : C_DOWN, a);
     } else if (now > 0) {
         if (ms == MKT_OPEN) { fmt_dur(close_at - now, s2, sizeof s2); snprintf(s1, sizeof s1, "CLOSES IN %s", s2); }
         else { fmt_dur(nopen - now, s2, sizeof s2); snprintf(s1, sizeof s1, "OPENS IN %s", s2); }
-        text_draw_centered(st, &font_caps11, s1, cx, 281 + yo, 1.2f, rgb565(130, 114, 88), a);
+        text_draw_centered(st, &font_caps11, s1, cx, 270 + yo, 1.0f, rgb565(130, 114, 88), a);
     }
 }
 
-static void page_held(strip_t *st, int a, int yo)
-{
-    const quote_t *q = &S.m->quote;
-    const purchase_t *p = &S.m->mint.p;
-    int cx = SCR_W / 2;
-    char s1[40], s2[40];
-    text_draw_centered(st, &font_caps11, "SINCE YOU BOUGHT", cx, 36 + yo, 0.4f, C_GOLD_DIM, a);
-    if (q->valid) {
-        double g = (q->price / p->price - 1) * 100;
-        snprintf(s1, sizeof s1, "%+.2f%%", g);
-        text_draw_centered(st, &font_mono32, s1, cx, 80 + yo, 0, g >= 0 ? C_UP : C_DOWN, a);
-        snprintf(s1, sizeof s1, "$%.2f  >  $%.2f", p->price, q->price);
-        text_draw_centered(st, &font_mono11, s1, cx, 99 + yo, 0, C_GOLD_DIM, a);
-    }
-    if (CHT.ok) draw_chart(st, a, yo);
-    int d = days_held(S.m);
-    snprintf(s2, sizeof s2, d > 0 ? "%d" : "--", d);
-    row_lr(st, 222 + yo, "DAYS HELD", s2, C_GOLD, a);
-    /* best and worst close while held, from the chart's own points */
-    if (CHT.ok && CHT.page == 1) {
-        static cpt_t pt[INTRA_MAX + 2];
-        float r1, r2, mx, mv;
-        int n = chart_points(1, pt, INTRA_MAX + 2, &r1, &r2, &mx, &mv);
-        float hi = -1e9f, lo = 1e9f;
-        for (int i = 0; i < n; i++) { hi = fmaxf(hi, pt[i].v); lo = fminf(lo, pt[i].v); }
-        snprintf(s2, sizeof s2, "%.2f", hi);
-        row_lr(st, 240 + yo, "HIGHEST", s2, C_GOLD, a);
-        snprintf(s2, sizeof s2, "%.2f", lo);
-        row_lr(st, 258 + yo, "LOWEST", s2, C_GOLD, a);
-    }
-    if (q->valid) {
-        int sh = p->shares > 0 ? p->shares : 1;
-        snprintf(s2, sizeof s2, "%+.2f", (q->price - p->price) * sh);
-        row_lr(st, 276 + yo, "P / L  $", s2, q->price >= p->price ? C_UP : C_DOWN, a);
-    }
-}
-
-static void page_ipo(strip_t *st, int a, int yo)
-{
-    const quote_t *q = &S.m->quote;
-    const purchase_t *p = &S.m->mint.p;
-    int cx = SCR_W / 2;
-    char s1[40], s2[40];
-    text_draw_centered(st, &font_caps11, "SINCE IPO", cx, 36 + yo, 2.0f, C_GOLD_DIM, a);
-    if (q->valid) {
-        snprintf(s1, sizeof s1, "x%.2f", q->price / IPO_PRICE);
-        text_draw_centered(st, &font_mono32, s1, cx, 80 + yo, 0, q->price >= IPO_PRICE ? C_UP : C_DOWN, a);
-    }
-    text_draw_centered(st, &font_mono11, "IPO $83.00  NOV 19", cx, 99 + yo, 0, C_GOLD_DIM, a);
-    if (CHT.ok) draw_chart(st, a, yo);
-    double total = (q->valid && q->total_shares > 1e6) ? q->total_shares : DEFAULT_TOTAL_SHARES;
-    if (q->valid) {
-        fmt_big(total * q->price, s2, sizeof s2);
-        char s3[24];
-        snprintf(s3, sizeof s3, "$%s", s2);
-        row_lr(st, 222 + yo, "MKT CAP", s3, C_GOLD, a);
-    }
-    snprintf(s2, sizeof s2, "%.2f", p->price);
-    row_lr(st, 240 + yo, "ENTRY", s2, C_GOLD, a);
-    fmt_pct_tiny(100.0 * (p->shares > 0 ? p->shares : 1) / total, s1, sizeof s1);
-    text_draw_centered(st, &font_caps11, "YOU OWN", cx, 262 + yo, 1.4f, C_GOLD_DIM, a);
-    text_draw_centered(st, &font_mono11, s1, cx, 277 + yo, 0, C_GOLD, a);
-}
-
-static void render_ledger(strip_t *st)
+static void render_back(strip_t *st)
 {
     render_enamel(st);
     if (st->y0 > PANEL_Y1 || st->y0 + st->h < PANEL_Y0) return;
-    /* page crossfade: out (0..0.12s), switch, in (0.12..0.30s) */
     int a = 256, yo = 0;
     if (S.mfading) {
         float t = S.mfade_t;
         if (t < 0.12f) a = (int)(256 * (1 - t / 0.12f));
         else { float u = clampf((t - 0.12f) / 0.18f, 0, 1); a = (int)(256 * ease_out_cubic(u)); yo = (int)lrintf(6 * (1 - ease_out_cubic(u))); }
     }
-    int pg = S.mpage;
-    if (pg == 0) page_today(st, a, yo);
-    else if (pg == 1) page_held(st, a, yo);
-    else page_ipo(st, a, yo);
-    /* page dots */
-    for (int i = 0; i < 3; i++) {
-        float x = SCR_W / 2.0f + (i - 1) * 10;
-        fill_rrect(st, x - 2, 296, x + 2, 300, 2, i == S.mpage ? C_GOLD_HI : rgb565(70, 60, 44), 256);
+    if (S.mpage == 0) page_line(st, a, yo);
+    else page_market(st, a, yo);
+    for (int i = 0; i < 2; i++) {
+        float x = SCR_W / 2.0f + (i ? 5 : -5);
+        fill_rrect(st, x - 2, 292, x + 2, 296, 2, i == S.mpage ? C_GOLD_HI : rgb565(70, 60, 44), 256);
     }
-    /* a big day gets a small mark, nothing louder */
     const quote_t *q = &S.m->quote;
     if (q->valid && fabs(q->chg_pct) >= 5) {
         uint16_t c = q->chg_pct >= 0 ? C_UP : C_DOWN;
@@ -1191,13 +1367,8 @@ static void render_ledger(strip_t *st)
 
 static void render_face(int f, strip_t *st)
 {
-    if (f == F_FRONT) {
-        if (S.front) render_metal(st, S.front, S.lut_front, false);
-    } else if (f == F_LINE) {
-        render_line_face(st);
-    } else {
-        render_ledger(st);
-    }
+    if (f == F_FRONT) { if (S.front) render_metal(st, S.front, S.lut_front, false); }
+    else render_back(st);
 }
 
 static float flip_angle(void) { return S.fth; }
@@ -1443,16 +1614,21 @@ bool scene_init(model_t *m)
     S.m = m;
     S.fade = 0;
     build_bg();
+    build_noise();
+    ensure_base();
+    if (!S.base) return false;
     if (m->mint.minted) {
         S.st = ST_FACES;
-        ensure_base();
         if (!ensure_front(&m->mint.p, m->mint.serial)) return false;
-        build_back(true);
+        if (!m->assay.valid) {      /* first weighing = the purchase itself */
+            m->assay = (assay_t){ .valid = true, .price = m->mint.p.price, .grams = 0, .close_day = 0 };
+            S.events |= EV_ASSAY;
+        }
+        zone_show(m->assay.price, m->assay.grams);
+        prepare_line();
         glint_start(1.2f, 26, 22, 6, 8, 0);
     } else {
         S.st = ST_SETUP;
-        ensure_base();
-        if (!S.base) return false;
     }
     S.dirty = true;
     return true;
@@ -1471,6 +1647,7 @@ void scene_rehearse(void)
     S.t = 0;
     S.flipping = false;
     S.face = F_FRONT;
+    S.as_phase = 0;
     S.dirty = true;
 }
 
@@ -1482,13 +1659,18 @@ static void begin_mint(void)
     S.stamps_done = 0;
     S.dy = S.dyv = 0;
     memset(S.band_flash, 0, sizeof S.band_flash);
+    model_t *m = S.m;
     if (!S.rehearsal) {
-        model_t *m = S.m;
         m->mint.minted = true;
         m->mint.p = m->setup.pending;
         m->mint.mint_ts = m->now;
         m->patina_day = days_held(m);
-        S.events |= EV_MINTED;
+        /* the first weighing is the purchase itself */
+        m->assay = (assay_t){ .valid = true, .price = m->mint.p.price, .grams = grams_for(m->mint.p.price), .close_day = 0 };
+        S.events |= EV_MINTED | EV_ASSAY;
+        zone_show(m->assay.price, m->assay.grams);
+    } else {
+        zone_show(m->assay.price, m->assay.grams);
     }
 }
 
@@ -1496,19 +1678,25 @@ static void ledger_prepare(void)
 {
     const quote_t *q = &S.m->quote;
     const purchase_t *p = &S.m->mint.p;
-    int sh = p->shares > 0 ? p->shares : 1;
     double from = S.have_shown ? S.shown_price : p->price;
     double to = q->valid ? q->price : from;
     S.led_from[0] = from; S.led_to[0] = to;
     S.led_from[1] = 0; S.led_to[1] = q->chg_pct;
-    S.led_from[2] = from * sh; S.led_to[2] = to * sh;
-    S.led_from[3] = (from / p->price - 1) * 100; S.led_to[3] = (to / p->price - 1) * 100;
-    S.led_from[4] = from / IPO_PRICE; S.led_to[4] = to / IPO_PRICE;
     S.shown_price = to;
     S.have_shown = q->valid;
     S.ledger_ready = true;
     S.ledger_t = 0;
     S.ledger_anim = false;
+}
+
+static void finish_line(void)
+{
+    S.burin = false;
+    S.burin_pos = (float)S.nchars;
+    if (S.m->line_seen_day != S.line_for_day) {
+        S.m->line_seen_day = S.line_for_day;
+        S.events |= EV_LINE_SEEN;
+    }
 }
 
 static void land_on(int f)
@@ -1517,38 +1705,35 @@ static void land_on(int f)
     S.flipping = false;
     S.cooldown = S.m->tune.shake_cooldown_ms / 1000.0f;
     if (f == F_FRONT) glint_start(0.5f, 24, 18, 6, 8, 0);
-    if (f == F_LINE) {
-        int day = days_held(S.m);
-        if (!S.back_built || S.line_for_day != day || strcmp(S.line, current_line(day))) build_back(false);
-        bool seen = S.m->line_seen_day == day && day > 0;
-        if (seen && S.burin_done < S.nchars) { for (int k = S.burin_done; k < S.nchars; k++) engrave_char(k); S.burin_done = S.nchars; }
-        S.burin = S.burin_done < S.nchars;
-        if (!S.burin) glint_start(0.5f, 20, 18, 6, 8, 0);
-    }
-    if (f == F_LEDGER) {
-        if (!S.ledger_ready) ledger_prepare();
-        S.ledger_ready = false;
-        S.ledger_t = 0;
-        S.ledger_anim = S.m->quote.valid;
+    if (f == F_BACK) {
+        if (S.mpage == 0) {
+            int day = days_held(S.m);
+            S.burin = !(S.m->line_seen_day == day && day > 0);
+            S.burin_pos = S.burin ? -1.5f : (float)S.nchars;
+        } else {
+            if (!S.ledger_ready) ledger_prepare();
+            S.ledger_ready = false;
+            S.ledger_t = 0;
+            S.ledger_anim = S.m->quote.valid;
+        }
     }
 }
 
 static void start_flip(void)
 {
-    if (S.face == F_LINE && S.burin) {           /* finish the engraving before turning away */
-        for (int k = S.burin_done; k < S.nchars; k++) engrave_char(k);
-        S.burin_done = S.nchars;
-        S.burin = false;
-        S.m->line_seen_day = S.line_for_day;
-        S.events |= EV_LINE_SEEN;
+    if (S.face == F_BACK && S.burin) finish_line();
+    S.face_to = S.face == F_FRONT ? F_BACK : F_FRONT;
+    if (S.face_to == F_BACK) {
+        if (line_is_stale()) prepare_line();
+        int day = days_held(S.m);
+        if (!(S.m->line_seen_day == day && day > 0)) S.mpage = 0;     /* a new line comes first */
+        if (S.mpage == 0) { S.burin = false; S.burin_pos = -100; }    /* blank until it lands */
+        else { ledger_prepare(); build_chart(0); }
     }
-    S.face_to = (S.face + 1) % F_COUNT;
-    if (S.face_to != F_FRONT && !S.back_built) build_back(false);
     S.flipping = true;
     S.flip_t = 0;
     S.fth = 0;
     S.fvel = 2.5f;          /* the shake gives it a small kick */
-    if (S.face_to == F_LEDGER) { ledger_prepare(); build_chart(S.mpage); }
     S.glint_on = false;
 }
 
@@ -1560,6 +1745,45 @@ static void update_qr(void)
     uint8_t tmp[qrcodegen_BUFFER_LEN_FOR_VERSION(6)];
     S.qr_ok = qrcodegen_encodeText(want, tmp, S.qr, qrcodegen_Ecc_LOW, 1, 6, qrcodegen_Mask_AUTO, true);
     snprintf(S.qr_for, sizeof S.qr_for, "%s", want);
+}
+
+static void back_tick(float dt, bool tap)
+{
+    model_t *m = S.m;
+    const tune_t *tu = &m->tune;
+    if (tap) {
+        if (S.mpage == 0 && S.burin) finish_line();          /* first tap completes the line */
+        else if (!S.mfading) { S.mfading = true; S.mfade_t = 0; S.mpage_to = 1 - S.mpage; }
+    }
+    if (S.mfading) {
+        float before = S.mfade_t;
+        S.mfade_t += dt;
+        if (before < 0.12f && S.mfade_t >= 0.12f) {
+            S.mpage = S.mpage_to;
+            if (S.mpage == 1) { ledger_prepare(); build_chart(0); S.ledger_ready = false; S.ledger_anim = m->quote.valid; }
+        }
+        if (S.mfade_t >= 0.30f) S.mfading = false;
+    }
+    if (S.mpage == 0) {
+        if (S.burin) {
+            S.burin_pos += dt * 1000.0f / (tu->burin_ms > 5 ? tu->burin_ms : 5);
+            if (S.burin_pos >= S.nchars + 3) { finish_line(); glint_start(0.6f, 18, 18, 6, 8, 0); }
+        } else if (line_is_stale()) {
+            prepare_line();
+            S.burin = true;
+            S.burin_pos = -1.5f;
+        }
+    } else {
+        if (CHT.page != 0 || CHT.rev != chart_rev_now()) { build_chart(0); S.dirty = true; }
+        int minute = (int)(m->now / 60);
+        if (minute != S.last_minute) { S.last_minute = minute; S.dirty = true; }
+        if (S.ledger_anim) { S.ledger_t += dt; if (S.ledger_t > 1.2f) S.ledger_anim = false; }
+        if (!S.ledger_anim && !S.mfading && m->quote.valid && (!S.have_shown || fabs(m->quote.price - S.shown_price) > 0.004)) {
+            ledger_prepare();
+            S.ledger_ready = false;
+            S.ledger_anim = true;
+        }
+    }
 }
 
 void scene_tick(float dt, const input_t *in)
@@ -1591,7 +1815,6 @@ void scene_tick(float dt, const input_t *in)
             S.ty_applied = S.ty;
             light_update(S.tx, S.ty, tu->silk, tu->shadow_px, S.drift);
         }
-        /* picked up after resting: wake, and let a first light run across the face */
         float dmove = fabsf(S.tx - S.ref_tx) + fabsf(S.ty - S.ref_ty);
         if (dmove > 0.12f) {
             if (S.still_t > 45 && S.st == ST_FACES && !S.flipping) glint_start(0.9f, 26, 22, 6, 8, 0);
@@ -1604,7 +1827,7 @@ void scene_tick(float dt, const input_t *in)
     }
     if (act) S.events |= EV_ACTIVITY;
 
-    /* ---- touch: long press → zoom, tap → skip */
+    /* ---- touch: long press → zoom, tap → page / skip */
     bool tap = false;
     if (in->touch) {
         if (!S.pressed) { S.pressed = true; S.press_t = 0; S.px = in->tx; S.py = in->ty; S.long_fired = false; }
@@ -1627,7 +1850,10 @@ void scene_tick(float dt, const input_t *in)
         }
         if (!S.glint_on && fmodf(S.clock, 5.0f) < dt) glint_start(2.4f, 9, 30, 6, 8, 0);
         if (m->setup.stage == SETUP_READY) {
-            if (ensure_front(&m->setup.pending, m->mint.serial)) { S.st = ST_READY; S.t = 0; S.heat = 0; S.rehearsal = false; }
+            if (ensure_front(&m->setup.pending, m->mint.serial)) {
+                S.st = ST_READY; S.t = 0; S.heat = 0; S.rehearsal = false;
+                zone_show(m->setup.pending.price, 0);
+            }
         }
         set_front_params((metal_params_t){ .finish = 0, .gain = 1 });
         break;
@@ -1649,7 +1875,6 @@ void scene_tick(float dt, const input_t *in)
         float sp = tu->mint_speed > 0.2f ? tu->mint_speed : 1;
         S.mt += dt * sp;
         float t = S.mt;
-        /* heat: flash, hold, cool exponentially */
         float T;
         if (t < 0.12f) T = lerpf(0.74f, 1.0f, t / 0.12f);
         else if (t < 0.28f) T = 1.0f;
@@ -1660,7 +1885,6 @@ void scene_tick(float dt, const input_t *in)
         float fin = smoothstep01((t - 0.3f) / 1.6f);
         float gain = 1.0f + 0.25f * clampf(1 - fabsf(t - 0.18f) / 0.18f, 0, 1);
         set_front_params((metal_params_t){ .finish = fin, .heat = T, .gain = gain, .patina = 0 });
-        /* stamps */
         const float t0 = 1.85f, gap = 0.17f;
         while (S.stamps_done < S.lay.nbands && t >= t0 + S.stamps_done * gap) {
             float w = S.lay.bands[S.stamps_done].weight;
@@ -1670,7 +1894,6 @@ void scene_tick(float dt, const input_t *in)
             S.stamps_done++;
         }
         for (int b = 0; b < 6; b++) S.band_flash[b] = fmaxf(0, S.band_flash[b] - dt / 0.28f);
-        /* damped spring for the stamp jolt */
         float k = 1400, c = 34;
         float acc = -k * S.dy - c * S.dyv;
         S.dyv += acc * dt;
@@ -1685,7 +1908,9 @@ void scene_tick(float dt, const input_t *in)
             S.cooldown = 0.6f;
             S.need_calm = true;     /* the hand that minted is probably still shaking */
             S.calm_t = 0;
-            if (!S.back_built) build_back(false);
+            S.as_phase = 1;         /* hold the first weighing for a few seconds */
+            S.as_t = 0;
+            prepare_line();
         }
         break;
     }
@@ -1715,44 +1940,12 @@ void scene_tick(float dt, const input_t *in)
         if (S.flipping) {
             S.flip_t += dt;
             if (flip_step(dt) || S.flip_t * 1000 > tu->flip_ms * 2.5f) land_on(S.face_to);
-        } else if ((in->btn_short || (in->shake && !S.need_calm)) && S.cooldown <= 0) {
+        } else if ((in->btn_short || (in->shake && !S.need_calm)) && S.cooldown <= 0 && S.as_phase != 2) {
             start_flip();
         }
-        /* daily line engraving */
-        if (S.face == F_LINE && !S.flipping && S.burin) {
-            if (tap) S.burin_pos = (float)S.nchars;
-            else {
-                S.burin_pos += dt * 1000.0f / (tu->burin_ms > 5 ? tu->burin_ms : 5);
-            }
-            while (S.burin_done < (int)S.burin_pos && S.burin_done < S.nchars) engrave_char(S.burin_done++);
-            if (S.burin_done >= S.nchars) {
-                S.burin = false;
-                m->line_seen_day = S.line_for_day;
-                S.events |= EV_LINE_SEEN;
-                glint_start(0.6f, 22, 18, 6, 8, 0);
-            }
-        }
-        /* new data while showing it */
-        if (S.face == F_LINE && !S.flipping && !S.burin) {
-            int d = days_held(m);
-            if (d != S.line_for_day || strcmp(S.line, current_line(d))) { build_back(false); S.burin = true; }
-        }
-        if (S.face == F_LEDGER && !S.flipping) {
-            if (tap && !S.mfading) { S.mfading = true; S.mfade_t = 0; S.mpage_to = (S.mpage + 1) % 3; }
-            if (S.mfading) {
-                float before = S.mfade_t;
-                S.mfade_t += dt;
-                if (before < 0.12f && S.mfade_t >= 0.12f) { S.mpage = S.mpage_to; build_chart(S.mpage); }
-                if (S.mfade_t >= 0.30f) S.mfading = false;
-            }
-            if (!S.mfading && (CHT.page != S.mpage || CHT.rev != chart_rev_now())) { build_chart(S.mpage); S.dirty = true; }
-            int minute = (int)(m->now / 60);
-            if (minute != S.last_minute) { S.last_minute = minute; S.dirty = true; }
-            if (S.ledger_anim) { S.ledger_t += dt; if (S.ledger_t > 1.2f) S.ledger_anim = false; }
-            if (!S.ledger_anim && m->quote.valid && (!S.have_shown || fabs(m->quote.price - S.shown_price) > 0.004)) { ledger_prepare(); land_on(F_LEDGER); }
-        }
-        /* long press → zoom */
-        if (S.pressed && !S.long_fired && !S.flipping && S.press_t * 1000 >= tu->longpress_ms) {
+        zone_tick(dt);
+        if (S.face == F_BACK && !S.flipping) back_tick(dt, tap);
+        if (S.pressed && !S.long_fired && !S.flipping && S.as_phase != 2 && S.press_t * 1000 >= tu->longpress_ms) {
             S.long_fired = true;
             S.ring_fade = 1;
             S.st = ST_ZOOM;
@@ -1786,9 +1979,7 @@ void scene_tick(float dt, const input_t *in)
         break;
     }
     }
-    if (S.st == ST_SETUP || S.st == ST_READY || S.st == ST_MINT) {
-        if (S.st != ST_MINT) S.led_pulse = 0;
-    }
+    if (S.st == ST_SETUP || S.st == ST_READY) S.led_pulse = 0;
     if (S.led_pulse > 0) S.led_pulse = fmaxf(0, S.led_pulse - dt / 0.18f);
     glint_update();
 }
@@ -1836,12 +2027,17 @@ void scene_led(uint8_t *r, uint8_t *g, uint8_t *b)
         blackbody(T, &er, &eg, &eb);
         float lv = T * T;
         R = er * lv; G = eg * lv; B = eb * lv;
-        R += S.led_pulse * 1.0f; G += S.led_pulse * 0.7f; B += S.led_pulse * 0.3f;
-    } else if (S.st == ST_FACES && S.burin && !S.flipping && S.face == F_LINE) {
+    } else if (S.st == ST_FACES && S.burin && !S.flipping && S.face == F_BACK && S.mpage == 0) {
         float f = 0.08f + 0.06f * sinf(S.clock * 53) * sinf(S.clock * 31);
         R = f; G = f * 0.75f; B = f * 0.45f;
+    } else if (S.st == ST_FACES && S.as_phase == 2) {
+        float er, eg, eb;
+        blackbody(0.6f, &er, &eg, &eb);
+        float lv = S.zglow * 0.5f;
+        R = er * lv; G = eg * lv; B = eb * lv;
     }
-    if (S.st == ST_FACES && !(S.burin && S.face == F_LINE) && S.m->quote.valid && S.m->now > 0 &&
+    R += S.led_pulse * 1.0f; G += S.led_pulse * 0.7f; B += S.led_pulse * 0.3f;
+    if (S.st == ST_FACES && !(S.burin && S.face == F_BACK) && S.m->quote.valid && S.m->now > 0 &&
         market_state(S.m->now, NULL, NULL) == MKT_OPEN) {
         float br = 0.035f + 0.02f * sinf(S.clock * 1.6f);
         if (S.m->quote.price >= S.m->mint.p.price) { R += br; G += br * 0.68f; B += br * 0.22f; }
@@ -1865,9 +2061,17 @@ uint32_t scene_take_events(void)
 
 bool scene_animating(void)
 {
+    S.partial = false;
     if (S.dirty) { S.dirty = false; return true; }
     if (S.fade < 1 || S.st != ST_FACES || S.flipping || S.glint_on || S.burin || S.ledger_anim || S.mfading ||
-        S.sweeping || S.pressed || S.ring_fade > 0 || S.m->settings_mode)
+        S.sweeping || S.pressed || S.ring_fade > 0 || S.m->settings_mode || S.as_phase == 2 || S.dy != 0)
         return true;
+    if (S.face == F_FRONT && S.furnace > 0.003f) { S.partial = true; return true; }   /* only the molten letters move */
     return false;
+}
+
+void scene_dirty_rows(int *y0, int *y1)
+{
+    if (S.partial) { *y0 = ZONE_Y0 - 2; *y1 = ZONE_Y1 + 3; }
+    else { *y0 = 0; *y1 = SCR_H; }
 }

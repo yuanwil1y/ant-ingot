@@ -320,6 +320,27 @@ static bool fetch_history(void)
     return ok;
 }
 
+/* Spot gold (London, USD/oz) from Sina: first field of hf_XAU */
+static bool fetch_gold(void)
+{
+    char buf[256] = { 0 };
+    body_t b = { buf, 0, sizeof buf };
+    esp_http_client_config_t cfg = { .url = "http://hq.sinajs.cn/list=hf_XAU", .event_handler = on_http, .user_data = &b, .timeout_ms = 8000 };
+    esp_http_client_handle_t h = esp_http_client_init(&cfg);
+    esp_http_client_set_header(h, "Referer", "https://finance.sina.com.cn");
+    esp_err_t e = esp_http_client_perform(h);
+    int st = esp_http_client_get_status_code(h);
+    esp_http_client_cleanup(h);
+    if (e != ESP_OK || st != 200) return false;
+    char *q = strchr(buf, '"');
+    double g = q ? atof(q + 1) : 0;
+    if (g < 100 || g > 100000) return false;
+    LOCK();
+    M->quote.gold = g;
+    UNLOCK();
+    return true;
+}
+
 /* Sina carries the pre-market / after-hours price (fields 21, 22) */
 static bool fetch_extended(void)
 {
@@ -479,6 +500,7 @@ static void check_task(void *arg)
     set_chk(0, CHK_OK);
     set_chk(1, CHK_RUNNING);
     if (!fetch_quote() && !fetch_quote()) { set_chk(1, CHK_FAIL); fail("Market data unreachable"); goto out; }
+    fetch_gold();       /* best effort: the first weighing wants a gold price */
     set_chk(1, CHK_OK);
     set_chk(2, CHK_RUNNING);
     {
@@ -857,7 +879,7 @@ void net_on_minted(void) { xTaskCreate(minted_off_task, "apoff", 2048, NULL, 2, 
 
 static void worker(void *arg)
 {
-    int64_t last_quote = -100000, last_intra = -100000, last_hist = -100000, last_ext = -100000, last_ds = -100000;
+    int64_t last_quote = -100000, last_intra = -100000, last_hist = -100000, last_ext = -100000, last_ds = -100000, last_gold = -100000;
     mkt_t prev_state = MKT_CLOSED;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(2000));
@@ -885,6 +907,7 @@ static void worker(void *arg)
             prev_state = ms;
         }
         if (now_s - last_quote >= q_every) { last_quote = now_s; fetch_quote(); }
+        if (now_s - last_gold >= (ms == MKT_OPEN ? 600 : 300)) { if (fetch_gold()) last_gold = now_s; else last_gold = now_s - 240; }
         if ((ms == MKT_PRE || ms == MKT_AFTER) && now_s - last_ext >= 60) { last_ext = now_s; fetch_extended(); }
         if (now_s - last_intra >= i_every) { if (fetch_intraday()) last_intra = now_s; else last_intra = now_s - i_every + 60; }
         if (now_s - last_hist >= 6 * 3600) { if (fetch_history()) last_hist = now_s; else last_hist = now_s - 6 * 3600 + 120; }

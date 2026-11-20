@@ -25,9 +25,20 @@ typedef struct {
     double price, prev_close, open, high, low, chg_pct, volume;
     double total_shares;
     double ext_price, ext_pct;  /* pre-market / after-hours, 0 if none */
+    double gold;                /* spot gold, USD per troy ounce, 0 if unknown */
     char when[24];          /* exchange time, e.g. "2026-11-19 16:00:01" (ET) */
     int64_t fetched_ts;
 } quote_t;
+
+/* The front's living inscription: the bar is "weighed" at each close. */
+typedef struct {
+    bool valid;
+    double price;               /* per share, USD */
+    double grams;               /* whole holding in grams of gold, 0 if gold was unknown */
+    int32_t close_day;          /* ET day index of the close it shows; 0 = the purchase itself */
+} assay_t;
+
+#define TROY_OZ_G 31.1034768
 
 /* Today's minute prices (regular session) and longer daily/weekly closes. */
 #define INTRA_MAX 400
@@ -101,6 +112,7 @@ typedef struct {
     mint_rec_t mint;
     setup_t setup;
     quote_t quote;
+    assay_t assay;
     intraday_t intra;
     series_t daily;             /* daily closes, or weekly once the history outgrows SERIES_MAX */
     char line[160];         /* today's DeepSeek line */
