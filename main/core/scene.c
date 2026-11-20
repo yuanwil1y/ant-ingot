@@ -742,7 +742,10 @@ static struct {
     bool ok;
     int n;
     float lo, hi;
-    float ref1, ref2, mark_x, mark_v, end_x, end_v;
+    float ref1, ref2, mark_x, mark_v, end_x, end_v, mark_line_y;
+    bool label_below;
+    int16_t top[CH_W];      /* line height per column, 12.4 fixed; -1 = no line */
+    int32_t inv[CH_W];      /* 2^24 / (distance from line to chart bottom) */
 } CHT = { .page = -1 };
 
 static float chart_y(float v) { return CH_H - 6 - (v - CHT.lo) / (CHT.hi - CHT.lo) * (CH_H - 12); }
@@ -797,13 +800,23 @@ static void build_chart(int page)
         }
     }
     for (int x = 0; x < CH_W; x++) {
-        if (colmin[x] > 1e8f) continue;
-        for (int y = (int)colmin[x] + 1; y < CH_H; y++) {
-            float f = 1 - (y - colmin[x]) / (CH_H - colmin[x]);
-            int a = (int)(f * f * 15);
-            uint8_t *mp = &CHT.mask[y * CH_W + x];
-            *mp = (uint8_t)((*mp & 0xF0) | a);
-        }
+        if (colmin[x] > 1e8f) { CHT.top[x] = -1; continue; }
+        CHT.top[x] = (int16_t)(colmin[x] * 16);                 /* 12.4 fixed */
+        CHT.inv[x] = (int32_t)(65536.0f * 256 / fmaxf(1, CH_H - colmin[x]));
+    }
+    /* where the purchase marker sits relative to the line */
+    CHT.mark_line_y = -1;
+    if (CHT.mark_x >= 0) {
+        int mx = (int)lrintf(CHT.mark_x * (CH_W - 1));
+        if (mx >= 0 && mx < CH_W && colmin[mx] < 1e8f) CHT.mark_line_y = colmin[mx];
+        /* put the label on the side the line is not: look at the line just around the marker */
+        float my = chart_y(CHT.mark_v), sum = 0;
+        int cnt = 0;
+        for (int x = mx - 24; x <= mx + 24; x++)
+            if (x >= 0 && x < CH_W && colmin[x] < 1e8f) { sum += colmin[x]; cnt++; }
+        CHT.label_below = cnt ? (sum / cnt < my) : true;
+        if (my > CH_H - 14) CHT.label_below = false;
+        if (my < 14) CHT.label_below = true;
     }
     CHT.end_x = pt[n - 1].x * (CH_W - 1);
     CHT.end_v = pt[n - 1].v;
@@ -821,17 +834,31 @@ static void draw_chart(strip_t *st, int alpha, int yoff)
     int y0 = CH_Y0 + yoff;
     int r1 = isnan(CHT.ref1) ? -999 : (int)lrintf(chart_y(CHT.ref1));
     int r2 = isnan(CHT.ref2) ? -999 : (int)lrintf(chart_y(CHT.ref2));
+    static const uint8_t bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
     for (int yy = 0; yy < st->h; yy++) {
         int y = st->y0 + yy, cy = y - y0;
         if (cy < 0 || cy >= CH_H) continue;
         uint16_t *o = &st->px[yy * SCR_W + CH_X0];
         const uint8_t *mr = &CHT.mask[cy * CH_W];
         bool d1 = cy == r1, d2 = cy == r2;
+        int cy16 = cy * 16;
         for (int x = 0; x < CH_W; x++) {
             uint16_t c = o[x];
             if ((d1 || d2) && ((x >> 2) & 1) == 0) c = blend565(c, d1 ? C_GOLD : C_GOLD_DIM, (d1 ? 150 : 110) * alpha >> 8);
-            int f = mr[x] & 15, l = mr[x] >> 4;
-            if (f) c = blend565(c, fill, (f * 7 * alpha) >> 8);
+            int t = CHT.top[x];
+            if (t >= 0 && cy16 > t) {
+                /* gradient below the line, squared falloff, ordered dither before 565 */
+                int u = 256 - (int)(((int64_t)(cy16 - t) * CHT.inv[x]) >> 20);
+                if (u > 0) {
+                    int a = (u * u >> 8) * alpha >> 8;              /* 0..256 */
+                    int d = bayer[((y & 3) << 2) | ((x + CH_X0) & 3)];
+                    int r = ((c >> 11) << 3) + (150 * a * 10 / 16 >> 8) + (d >> 1);
+                    int g = (((c >> 5) & 63) << 2) + (110 * a * 10 / 16 >> 8) + (d >> 2);
+                    int b = ((c & 31) << 3) + (40 * a * 10 / 16 >> 8) + (d >> 1);
+                    c = rgb565(r, g, b);
+                }
+            }
+            int l = mr[x] >> 4;
             if (l) c = blend565(c, line, (l * 17 * alpha) >> 8);
             o[x] = c;
         }
@@ -840,11 +867,26 @@ static void draw_chart(strip_t *st, int alpha, int yoff)
     float ex = CH_X0 + CHT.end_x + 0.5f, ey = y0 + chart_y(CHT.end_v);
     glow_add(st, ex, ey, 7, 255, 210, 140, 0.35f * alpha / 256);
     fill_rrect(st, ex - 2, ey - 2, ex + 2, ey + 2, 2, rgb565(255, 244, 214), alpha);
-    /* your purchase: a tiny ingot */
+    /* your purchase: a tiny ingot, tied to the line when it sits off it */
     if (CHT.mark_x >= 0) {
         float mx = CH_X0 + CHT.mark_x * (CH_W - 1) + 0.5f, my = y0 + chart_y(CHT.mark_v);
+        if (CHT.mark_line_y >= 0) {
+            float ly = y0 + CHT.mark_line_y;
+            if (fabsf(ly - my) > 4) {
+                float a0 = fminf(ly, my) + 3, a1 = fmaxf(ly, my) - 3;
+                for (float yy = a0; yy < a1; yy += 3)
+                    fill_rrect(st, mx - 0.6f, yy, mx + 0.6f, fminf(yy + 1.5f, a1), 0, C_GOLD, alpha * 200 >> 8);
+                fill_rrect(st, mx - 1.6f, ly - 1.6f, mx + 1.6f, ly + 1.6f, 1.6f, C_GOLD_HI, alpha);
+            }
+        }
         fill_rrect(st, mx - 4.5f, my - 3, mx + 4.5f, my + 3, 1.5f, rgb565(0, 0, 0), alpha * 160 >> 8);
         fill_rrect(st, mx - 3.5f, my - 2, mx + 3.5f, my + 2, 1, rgb565(236, 196, 104), alpha);
+        /* label on whichever side has room */
+        bool off_line = CHT.mark_line_y >= 0 && fabsf(y0 + CHT.mark_line_y - my) > 4;
+        int w = text_width(&font_caps11, "YOU", 1.0f);
+        float lx = clampf(mx - w / 2.0f, CH_X0, CH_X0 + CH_W - w);
+        float lyb = CHT.label_below ? my + 15 : my - 6;
+        if (off_line) text_draw(st, &font_caps11, "YOU", lx, (int)lyb, 1.0f, C_GOLD, alpha);
     }
 }
 
