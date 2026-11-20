@@ -268,7 +268,7 @@ static void build_band_rows(void)
         for (int y = S.lay.bands[b].y0; y <= S.lay.bands[b].y1 && y < SCR_H; y++) S.band_of_row[y] = (int8_t)b;
 }
 
-#define SURF_VERSION 6u
+#define SURF_VERSION 7u
 #define BASE_SEED 0x5eedu
 
 static void ensure_base(void)
