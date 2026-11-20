@@ -1755,6 +1755,7 @@ static void land_on(int f)
 {
     S.face = f;
     S.flipping = false;
+    S.dirty = true;         /* the landed face must be drawn even if nothing on it animates */
     S.cooldown = S.m->tune.shake_cooldown_ms / 1000.0f;
     if (f == F_FRONT) glint_start(0.5f, 24, 18, 6, 8, 0);
     if (f == F_BACK) {
@@ -1778,9 +1779,12 @@ static void start_flip(void)
     if (S.face_to == F_BACK) {
         if (line_is_stale()) prepare_line();
         int day = days_held(S.m);
-        if (!(S.m->line_seen_day == day && day > 0)) S.mpage = 0;     /* a new line comes first */
-        if (S.mpage == 0) { S.burin = false; S.burin_pos = -100; }    /* blank until it lands */
-        else { ledger_prepare(); build_chart(0); }
+        bool seen = S.m->line_seen_day == day && day > 0;
+        if (!seen) S.mpage = 0;                                       /* a new line comes first */
+        if (S.mpage == 0) {
+            S.burin = false;
+            S.burin_pos = seen ? (float)S.nchars : -100;              /* a new line stays blank until it lands */
+        } else { ledger_prepare(); build_chart(0); }
     }
     S.flipping = true;
     S.flip_t = 0;
@@ -1814,7 +1818,7 @@ static void back_tick(float dt, bool tap)
             S.mpage = S.mpage_to;
             if (S.mpage == 1) { ledger_prepare(); build_chart(0); S.ledger_ready = false; S.ledger_anim = m->quote.valid; }
         }
-        if (S.mfade_t >= 0.30f) S.mfading = false;
+        if (S.mfade_t >= 0.30f) { S.mfading = false; S.dirty = true; }   /* settle on the fully opaque page */
     }
     if (S.mpage == 0) {
         if (S.burin) {

@@ -156,6 +156,7 @@ make market.mp4    # 背面两页（使用 mkt.txt 里的真实行情）
 make assay.mp4     # 熔炉态 → 收盘称重
 ./sim heal         # 复现开机时还没对时的情况，验证不会误称重、能自动纠错
 ./sim flipcount    # 一次长晃只翻一次，停一下再晃又能翻
+GATE=1 ./sim seen  # 按固件的“只在有动画时才重画”运行，检查翻到背面不会停在空白
 make motion_test   # 用模拟的拿起、翻看、把玩、晃动动作测试晃动识别
 ```
 

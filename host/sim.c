@@ -8,12 +8,16 @@
 static model_t M;
 static uint16_t px[SCR_W * 40];
 
+static bool g_gate;                 /* behave like the firmware: redraw only when animating */
+static uint16_t screen[SCR_W * SCR_H];
 static void frame(FILE *out, int scale)
 {
     static unsigned char row[SCR_W * 3 * 4];
+    bool draw = !g_gate || scene_animating();
     for (int y0 = 0; y0 < SCR_H; y0 += 40) {
         strip_t st = { px, y0, 40 };
-        scene_render(&st);
+        if (draw) { scene_render(&st); memcpy(&screen[y0 * SCR_W], px, sizeof px); }
+        else memcpy(px, &screen[y0 * SCR_W], sizeof px);
         for (int yy = 0; yy < 40; yy++) {
             for (int x = 0; x < SCR_W; x++) {
                 uint16_t c = px[yy * SCR_W + x];
@@ -29,6 +33,7 @@ static void frame(FILE *out, int scale)
 int main(int argc, char **argv)
 {
     const char *script = argc > 1 ? argv[1] : "full";
+    g_gate = getenv("GATE") != NULL;
     int scale = 2;
     M.tune = tune_defaults();
     snprintf(M.setup.ap_ssid, sizeof M.setup.ap_ssid, "A Share of Anthropic Setup");
@@ -43,9 +48,10 @@ int main(int argc, char **argv)
     bool tilt = !strcmp(script, "tilt");
     bool assay = !strcmp(script, "assay");
     bool heal = !strcmp(script, "heal");
-    bool flipcount = !strcmp(script, "flipcount");     /* the v0.4.6 bug: boot before the clock is set */
-    bool minted_start = !strcmp(script, "faces") || market || tilt || assay || heal || flipcount;
-    if (market || tilt || assay || heal || flipcount) {
+    bool flipcount = !strcmp(script, "flipcount");
+    bool seen = !strcmp(script, "seen");     /* turn to a line already read today */     /* the v0.4.6 bug: boot before the clock is set */
+    bool minted_start = !strcmp(script, "faces") || market || tilt || assay || heal || flipcount || seen;
+    if (market || tilt || assay || heal || flipcount || seen) {
         M.setup.pending.price = 88.00; M.setup.pending.buy_ts = 1795185000;
         snprintf(M.setup.pending.inscription, sizeof M.setup.pending.inscription, "FOR THE LONG RUN.");
         M.now = 1795185000 + 13200;
@@ -72,7 +78,7 @@ int main(int argc, char **argv)
     const float dt = 1.0f / 30;
     float t = 0;
     int nframes = 0;
-    float end = flipcount ? 9 : heal ? 10 : assay ? 12 : (tilt ? 14 : (market ? 16 : (minted_start ? 30 : 46)));
+    float end = seen ? 4 : flipcount ? 9 : heal ? 10 : assay ? 12 : (tilt ? 14 : (market ? 16 : (minted_start ? 30 : 46)));
     while (t < end) {
         input_t in = { 0 };
         if (!minted_start) {
@@ -86,6 +92,15 @@ int main(int argc, char **argv)
             if (t >= 5.5f && M.setup.stage != SETUP_READY && !M.mint.minted) M.setup.stage = SETUP_READY;
             /* shaking from 7.5s for ~2s, with a pause in the middle */
             if (t > 7.5f && t < 10.2f && !(t > 8.4f && t < 8.8f)) in.shake_energy = 1.4f + 0.4f * sinf(t * 9);
+        }
+        if (seen) {
+            M.line_seen_day = 2;
+            if (fabsf(t - 1.0f) < dt / 2) in.shake = 1;
+            scene_tick(dt, &in);
+            scene_take_events();
+            frame(stdout, scale);
+            t += dt;
+            continue;
         }
         if (flipcount) {
             /* 0.5-2.0 s: one long hard shake (detector fires every ~0.2 s). 2.0-3.5 s: still.
