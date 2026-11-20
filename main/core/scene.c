@@ -2,6 +2,7 @@
 #include "ingot.h"
 #include "fonts.h"
 #include "qrcodegen.h"
+#include "market.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -483,10 +484,13 @@ static bool latest_close(int32_t *day)
     int hh = atoi(q->when + 11), mi = atoi(q->when + 14);
     if (hh * 60 + mi < 9 * 60 + 30) return false;
     int32_t d = ymd_to_days_s(Y * 10000 + Mo * 100 + D);
-    /* give the official close a few minutes to settle before weighing it */
+    /* give the official close a few minutes to settle before weighing it (half days close early) */
     if (S.m->now > 0) {
         int64_t et = S.m->now + us_et_offset(S.m->now);
-        if (et / 86400 == d && (et % 86400) < 16 * 3600 + 5 * 60) return false;
+        int64_t close_at = 0;
+        session_state(S.m, S.m->now, NULL, &close_at);
+        if (et / 86400 == d && close_at > 0 && S.m->now < close_at + 5 * 60) return false;
+        if (et / 86400 == d && close_at <= 0 && (et % 86400) < 16 * 3600 + 5 * 60) return false;
     }
     /* only closes after the purchase count */
     int64_t close_utc = (int64_t)d * 86400 + (hh * 60 + mi) * 60;
@@ -514,7 +518,7 @@ static void zone_tick(float dt)
 {
     model_t *m = S.m;
     if (!S.zbuf) return;
-    mkt_t ms = m->now > 0 ? market_state(m->now, NULL, NULL) : MKT_CLOSED;
+    mkt_t ms = m->now > 0 ? session_state(m, m->now, NULL, NULL) : MKT_CLOSED;
     if (S.as_phase == 1) { S.as_t += dt; if (S.as_t >= 3.0f) { S.as_phase = 0; S.as_t = 0; } }
 
     /* a close we have not weighed yet → the ceremony (waits briefly for a gold price) */
@@ -1290,7 +1294,7 @@ static void page_market(strip_t *st, int a, int yo)
     int cx = SCR_W / 2;
     char s1[40], s2[40];
     int64_t now = S.m->now, nopen = 0, close_at = 0;
-    mkt_t ms = now > 0 ? market_state(now, &nopen, &close_at) : MKT_CLOSED;
+    mkt_t ms = now > 0 ? session_state(S.m, now, &nopen, &close_at) : MKT_CLOSED;
     static const char *MS[] = { "CLOSED", "PRE", "OPEN", "AFTER" };
     text_draw(st, &font_caps11, "ANT", 26, 36 + yo, 2.0f, C_GOLD_DIM, a);
     {
@@ -2038,7 +2042,7 @@ void scene_led(uint8_t *r, uint8_t *g, uint8_t *b)
     }
     R += S.led_pulse * 1.0f; G += S.led_pulse * 0.7f; B += S.led_pulse * 0.3f;
     if (S.st == ST_FACES && !(S.burin && S.face == F_BACK) && S.m->quote.valid && S.m->now > 0 &&
-        market_state(S.m->now, NULL, NULL) == MKT_OPEN) {
+        session_state(S.m, S.m->now, NULL, NULL) == MKT_OPEN) {
         float br = 0.035f + 0.02f * sinf(S.clock * 1.6f);
         if (S.m->quote.price >= S.m->mint.p.price) { R += br; G += br * 0.68f; B += br * 0.22f; }
         else { R += br * 0.4f; G += br * 0.5f; B += br * 0.75f; }

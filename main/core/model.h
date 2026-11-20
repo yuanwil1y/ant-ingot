@@ -30,6 +30,16 @@ typedef struct {
     int64_t fetched_ts;
 } quote_t;
 
+/* Today's session as published by the exchange (Nasdaq market-info). */
+typedef struct {
+    bool valid;
+    int32_t day;                /* ET day index this was fetched for */
+    bool business;              /* false on holidays and weekends */
+    int64_t pre_open, open, close, post_close;   /* UTC; close is early on half days */
+    int64_t next_open;          /* UTC 09:30 ET of the next trading day, 0 if unknown */
+    int64_t fetched;
+} session_t;
+
 /* The front's living inscription: the bar is "weighed" at each close. */
 typedef struct {
     bool valid;
@@ -112,6 +122,7 @@ typedef struct {
     mint_rec_t mint;
     setup_t setup;
     quote_t quote;
+    session_t session;
     assay_t assay;
     intraday_t intra;
     series_t daily;             /* daily closes, or weekly once the history outgrows SERIES_MAX */

@@ -19,6 +19,7 @@
 #include "cJSON.h"
 #include "dns_server.h"
 #include "ingot.h"
+#include "market.h"
 
 static const char *TAG = "net";
 
@@ -317,6 +318,88 @@ static bool fetch_history(void)
         UNLOCK();
     }
     free(t);
+    return ok;
+}
+
+/* ---------------------------------------------------------------- exchange calendar
+ * Nasdaq's own market-info: today's pre/regular/after-hours times (early closes
+ * included), whether it is a trading day, and the next trading day. */
+
+static const char *jstr_net(cJSON *j, const char *k)
+{
+    cJSON *v = cJSON_GetObjectItem(j, k);
+    return cJSON_IsString(v) ? v->valuestring : NULL;
+}
+
+static int month_of(const char *s)
+{
+    static const char *M3[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    for (int i = 0; i < 12; i++) if (!strncmp(s, M3[i], 3)) return i + 1;
+    return 0;
+}
+
+/* "Nov 20, 2026 09:30 AM ET" (time optional) → UTC seconds, 0 on failure */
+static int64_t parse_et(const char *s, bool date_only_930)
+{
+    if (!s) return 0;
+    int mo = month_of(s), d = 0, y = 0, hh = 9, mi = 30;
+    char ap[3] = "AM";
+    if (!mo || sscanf(s + 4, "%d, %d", &d, &y) != 2) return 0;
+    if (!date_only_930) {
+        const char *t = strchr(s + 4, ',');
+        if (!t || sscanf(t + 1, " %*d %d:%d %2s", &hh, &mi, ap) != 3) return 0;
+        if (hh == 12) hh = 0;
+        if (ap[0] == 'P') hh += 12;
+    }
+    int64_t local = days_from_civil_net(y, mo, d) * 86400 + hh * 3600 + mi * 60;
+    return local - us_et_offset(local + 5 * 3600);
+}
+
+static bool fetch_session(void)
+{
+    char *buf = calloc(1, 3072);
+    if (!buf) return false;
+    body_t b = { buf, 0, 3072 };
+    esp_http_client_config_t cfg = {
+        .url = "https://api.nasdaq.com/api/market-info", .event_handler = on_http, .user_data = &b,
+        .timeout_ms = 12000, .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t h = esp_http_client_init(&cfg);
+    esp_http_client_set_header(h, "User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36");
+    esp_http_client_set_header(h, "Accept", "application/json");
+    esp_err_t e = esp_http_client_perform(h);
+    int st = esp_http_client_get_status_code(h);
+    esp_http_client_cleanup(h);
+    bool ok = false;
+    if (e == ESP_OK && st == 200) {
+        cJSON *r = cJSON_Parse(buf);
+        cJSON *d = r ? cJSON_GetObjectItem(r, "data") : NULL;
+        if (d) {
+            session_t ss = { 0 };
+            ss.business = cJSON_IsTrue(cJSON_GetObjectItem(d, "isBusinessDay"));
+            ss.pre_open = parse_et(jstr_net(d, "preMarketOpeningTime"), false);
+            ss.open = parse_et(jstr_net(d, "marketOpeningTime"), false);
+            ss.close = parse_et(jstr_net(d, "marketClosingTime"), false);
+            ss.post_close = parse_et(jstr_net(d, "afterHoursMarketClosingTime"), false);
+            ss.next_open = parse_et(jstr_net(d, "nextTradeDate"), true);
+            int64_t now = time(NULL);
+            ss.day = (int32_t)((now + us_et_offset(now)) / 86400);
+            ss.fetched = now;
+            ss.valid = ss.open > 0 || !ss.business;
+            if (ss.valid) {
+                if (!ss.pre_open) ss.pre_open = ss.open - 5 * 3600 - 30 * 60;
+                if (!ss.post_close) ss.post_close = ss.close + 4 * 3600;
+                LOCK();
+                M->session = ss;
+                UNLOCK();
+                ok = true;
+            }
+        }
+        cJSON_Delete(r);
+    } else {
+        ESP_LOGW(TAG, "market-info %d %s", st, esp_err_to_name(e));
+    }
+    free(buf);
     return ok;
 }
 
@@ -879,7 +962,7 @@ void net_on_minted(void) { xTaskCreate(minted_off_task, "apoff", 2048, NULL, 2, 
 
 static void worker(void *arg)
 {
-    int64_t last_quote = -100000, last_intra = -100000, last_hist = -100000, last_ext = -100000, last_ds = -100000, last_gold = -100000;
+    int64_t last_quote = -100000, last_intra = -100000, last_hist = -100000, last_ext = -100000, last_ds = -100000, last_gold = -100000, last_sess = -100000;
     mkt_t prev_state = MKT_CLOSED;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(2000));
@@ -898,7 +981,17 @@ static void worker(void *arg)
         if (!minted || s_checking) continue;
         if (!(xEventGroupGetBits(s_ev) & EV_CONNECTED)) continue;
         /* refresh cadence follows the market: open 15 s, pre/after 1 min, closed 10 min */
-        mkt_t ms = now > 0 ? market_state(now, NULL, NULL) : MKT_CLOSED;
+        /* the exchange calendar: at boot, every 30 min, and when the ET day turns */
+        if (net_time_valid()) {
+            int32_t etd = (int32_t)((now + us_et_offset(now)) / 86400);
+            LOCK();
+            bool stale = !M->session.valid || M->session.day != etd;
+            UNLOCK();
+            if ((stale && now_s - last_sess >= 60) || now_s - last_sess >= 1800) { last_sess = now_s; fetch_session(); }
+        }
+        LOCK();
+        mkt_t ms = now > 0 ? session_state(M, now, NULL, NULL) : MKT_CLOSED;
+        UNLOCK();
         int q_every = ms == MKT_OPEN ? 15 : (ms == MKT_CLOSED ? 600 : 60);
         int i_every = ms == MKT_OPEN ? 60 : 900;
         if (ms != prev_state) {                 /* a session boundary: refresh everything once */

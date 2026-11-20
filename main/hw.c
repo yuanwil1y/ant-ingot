@@ -16,6 +16,7 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "led_strip.h"
+#include "motion.h"
 
 static const char *TAG = "hw";
 
@@ -190,8 +191,9 @@ static bool imu_init(void)
         vTaskDelay(pdMS_TO_TICKS(20));
         reg_write(s_imu, 0x02, 0x40);         /* CTRL1: auto-increment, little endian */
         reg_write(s_imu, 0x03, 0x25);         /* CTRL2: accel +-8g, ~250 Hz */
+        reg_write(s_imu, 0x04, 0x55);         /* CTRL3: gyro +-512 dps, ~250 Hz */
         reg_write(s_imu, 0x06, 0x00);         /* CTRL5: no LPF tweaks */
-        reg_write(s_imu, 0x08, 0x01);         /* CTRL7: accel on */
+        reg_write(s_imu, 0x08, 0x03);         /* CTRL7: accel + gyro on */
         return true;
     }
     ESP_LOGW(TAG, "IMU not found");
@@ -200,54 +202,33 @@ static bool imu_init(void)
 
 static void input_task(void *arg)
 {
-    float g[3] = { 0, 0, 1 }, gf[3] = { 0, 0, 1 };
-    bool g_init = false, armed = true;
-    float energy = 0;
-    int64_t last_peak = 0;
-    float last_dir[3] = { 0 };
-    int count = 0;
+    motion_t mo;
+    motion_init(&mo);
     int64_t btn_down = 0;
     bool btn_prev = false, long_sent = false;
     int tick = 0;
     const float dt = 0.005f;
+    const float DPS = 3.14159265f / 180 / 64.0f;     /* +-512 dps: 64 LSB per dps → rad/s */
     TickType_t wake = xTaskGetTickCount();
     for (;;) {
         int64_t now = esp_timer_get_time();
-        /* ---- accelerometer */
+        /* ---- accelerometer + gyro */
         if (s_imu) {
-            uint8_t b[6];
-            if (reg_read(s_imu, 0x35, b, 6) == ESP_OK) {
-                float a[3];
-                for (int i = 0; i < 3; i++) a[i] = (int16_t)(b[2 * i] | (b[2 * i + 1] << 8)) / 4096.0f;
-                if (!g_init) { memcpy(g, a, sizeof g); memcpy(gf, a, sizeof gf); g_init = true; }
-                for (int i = 0; i < 3; i++) gf[i] += (a[i] - gf[i]) * 0.07f;   /* ~70 ms, for the light */
-                float hp[3], mag2 = 0;
+            uint8_t b[12];
+            if (reg_read(s_imu, 0x35, b, 12) == ESP_OK) {
+                float a[3], w[3];
                 for (int i = 0; i < 3; i++) {
-                    g[i] += (a[i] - g[i]) * 0.012f;          /* ~0.4 s gravity estimate */
-                    hp[i] = a[i] - g[i];
-                    mag2 += hp[i] * hp[i];
+                    a[i] = (int16_t)(b[2 * i] | (b[2 * i + 1] << 8)) / 4096.0f;
+                    w[i] = (int16_t)(b[6 + 2 * i] | (b[6 + 2 * i + 1] << 8)) * DPS;
                 }
-                float mag = sqrtf(mag2);
-                energy += (mag - energy) * (dt / 0.15f);
-                bool ev = false;
-                if (armed && mag > s_thresh) {
-                    armed = false;
-                    float dir[3] = { hp[0] / mag, hp[1] / mag, hp[2] / mag };
-                    float dot = dir[0] * last_dir[0] + dir[1] * last_dir[1] + dir[2] * last_dir[2];
-                    if (now - last_peak < 450000 && dot < -0.1f) count++;
-                    else count = 1;
-                    memcpy(last_dir, dir, sizeof dir);
-                    last_peak = now;
-                    if (count >= 2) { ev = true; count = 0; last_peak = 0; }
-                } else if (!armed && mag < s_thresh * 0.5f) {
-                    armed = true;
-                }
+                motion_out_t o;
+                motion_step(&mo, a, w, dt, now, s_thresh, &o);
                 taskENTER_CRITICAL(&s_mux);
-                s_in.energy = energy;
-                s_in.gx = gf[0];
-                s_in.gy = gf[1];
+                s_in.energy = o.energy;
+                s_in.gx = o.gx;
+                s_in.gy = o.gy;
                 s_in.gvalid = true;
-                if (ev) s_in.shake = true;
+                if (o.shake) s_in.shake = true;
                 taskEXIT_CRITICAL(&s_mux);
             }
         }
