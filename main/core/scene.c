@@ -250,7 +250,7 @@ static void build_band_rows(void)
         for (int y = S.lay.bands[b].y0; y <= S.lay.bands[b].y1 && y < SCR_H; y++) S.band_of_row[y] = (int8_t)b;
 }
 
-#define SURF_VERSION 5u
+#define SURF_VERSION 6u
 #define BASE_SEED 0x5eedu
 
 static void ensure_base(void)
@@ -378,7 +378,7 @@ static void build_back(bool engraved)
     if (S.m->now > 0) date_of(S.m->now, S.footer, sizeof S.footer);
     else snprintf(S.footer, sizeof S.footer, "ANT");
     w = text_width(&font_caps11, S.footer, 1.6f);
-    ingot_engrave_text(S.back, &font_caps11, S.footer, SCR_W / 2.0f - w / 2.0f, 300, 1.6f, -1);
+    ingot_engrave_text(S.back, &font_caps11, S.footer, SCR_W / 2.0f - w / 2.0f, 290, 1.6f, -1);
     snprintf(S.line, sizeof S.line, "%s", current_line(day));
     S.line_for_day = day;
     layout_line(S.line);
@@ -732,10 +732,10 @@ static void odometer(strip_t *st, const font_t *f, const char *from, const char 
 #define CH_Y0 110
 #define CH_W 126
 #define CH_H 90
-#define PANEL_X0 13
-#define PANEL_X1 157
-#define PANEL_Y0 13
-#define PANEL_Y1 307
+#define PANEL_X0 17
+#define PANEL_X1 153
+#define PANEL_Y0 17
+#define PANEL_Y1 303
 
 typedef struct { float x, v; } cpt_t;
 
@@ -1180,10 +1180,10 @@ static void render_ledger(strip_t *st)
     const quote_t *q = &S.m->quote;
     if (q->valid && fabs(q->chg_pct) >= 5) {
         uint16_t c = q->chg_pct >= 0 ? C_UP : C_DOWN;
-        draw_seg(st, 149, 18, 152, 21, 1.6f, c, 256);
-        draw_seg(st, 152, 21, 149, 24, 1.6f, c, 256);
-        draw_seg(st, 149, 24, 146, 21, 1.6f, c, 256);
-        draw_seg(st, 146, 21, 149, 18, 1.6f, c, 256);
+        draw_seg(st, 144, 21, 147, 24, 1.6f, c, 256);
+        draw_seg(st, 147, 24, 144, 27, 1.6f, c, 256);
+        draw_seg(st, 144, 27, 141, 24, 1.6f, c, 256);
+        draw_seg(st, 141, 24, 144, 21, 1.6f, c, 256);
     }
 }
 

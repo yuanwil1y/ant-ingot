@@ -52,8 +52,6 @@ button.ghost{background:none;color:var(--ink);border:1px solid var(--rule);lette
   </div>
   <label>Filled at (Beijing time)</label>
   <input id="time" type="datetime-local">
-  <label>Inscription (optional)</label>
-  <input id="ins" maxlength="18" placeholder="e.g. FOR THE LONG RUN">
   <div class="note">Engraved forever once minted.</div>
 
   <h2>DEEPSEEK</h2>
@@ -148,11 +146,10 @@ function initSetup(){
   if(p.price>0)$('price').value=p.price.toFixed(2);
   if(p.shares)$('shares').value=p.shares;
   if(p.buy_ts>0)$('time').value=bj(p.buy_ts).replace(' ','T');
-  if(p.inscription)$('ins').value=p.inscription;
 }
 $('go').onclick=()=>{
   const body={ssid:ssidOf($('ssidSel'),$('ssid')),pass:$('pass').value,price:parseFloat($('price').value),
-    shares:parseInt($('shares').value||'1'),time:$('time').value,inscription:$('ins').value,key:$('key').value};
+    shares:parseInt($('shares').value||'1'),time:$('time').value,key:$('key').value};
   body.keep_pass=!body.pass&&body.ssid===S.ssid;
   if(!body.ssid){$('formErr').textContent='Choose a Wi-Fi network.';return}
   if(!(body.price>0)||!body.time){$('formErr').textContent='Enter the fill price and time.';return}

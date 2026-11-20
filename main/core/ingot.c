@@ -51,18 +51,21 @@ void ingot_gen_base(uint8_t *buf, uint32_t seed, int back)
             if (d < -0.5f) { buf[y * SCR_W + x] = 0; continue; }
             float cov = clampf(d + 0.5f, 0, 1);
             float h;
+            bool rec = false;
             if (d < BAR_BEVEL) {
-                float t = d / BAR_BEVEL;
-                h = 16 + (PLATEAU - 16) * (1 - (1 - t) * (1 - t));    /* rounded shoulder */
+                h = 4 + (PLATEAU - 4) * (d / BAR_BEVEL);             /* flat 45-degree chamfer, sharp ridge */
             } else {
                 h = PLATEAU;
+                /* a fine engraved frame a few px inside the ridge, like a minted bar */
+                float g = 1 - fabsf(d - FRAME_IN) / 1.1f;
+                if (g > 0) { h -= 14 * g; rec = g > 0.5f; }
             }
             h += streak + ((hash32(x * 7919 + y * 104729 + seed) & 255) / 255.0f - 0.5f) * (back ? 0.8f : 1.1f);
             h *= cov;
             int v = (int)(h + 0.5f);
             if (v < 1) v = 1;
             if (v > 127) v = 127;
-            buf[y * SCR_W + x] = (uint8_t)v;
+            buf[y * SCR_W + x] = (uint8_t)(v | (rec ? IG_RECESS : 0));
         }
     }
 }
@@ -247,18 +250,19 @@ void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *mr, in
     uint8_t *ink = buf;
     memset(ink, 0, SCR_W * SCR_H);
     const int cx = SCR_W / 2;
-    const float rcx = 85, rcy = 124;
+    const float rcx = 85, rcy = 134;
     uint32_t seed = hash32((uint32_t)(p->price * 100 + 0.5) * 2654435761u ^ (uint32_t)p->buy_ts ^ (uint32_t)(p->buy_ts >> 32));
 
-    /* top inscriptions */
-    ink_text(ink, &font_caps13, "ANTHROPIC", cx, 31, 3.2f);
+    /* Layout sits inside the engraved frame (plateau starts at BAR_BEVEL, frame at FRAME_IN). */
+    (void)mr;
+    ink_text(ink, &font_caps13, "ANTHROPIC", cx, 40, 3.2f);
     {
         int wl = text_width(&font_caps11, "NASDAQ", 1.6f), wr = text_width(&font_caps11, "ANT", 1.6f);
         int gap = 14, tot = wl + gap + wr, x0 = cx - tot / 2;
         inktx_t c = { ink, 1.0f };
-        text_walk(&font_caps11, "NASDAQ", x0, 47, 1.6f, 0, SCR_H, ink_text_px, &c);
-        text_walk(&font_caps11, "ANT", x0 + wl + gap, 47, 1.6f, 0, SCR_H, ink_text_px, &c);
-        ink_diamond(ink, x0 + wl + gap / 2.0f, 43, 2.0f);
+        text_walk(&font_caps11, "NASDAQ", x0, 56, 1.6f, 0, SCR_H, ink_text_px, &c);
+        text_walk(&font_caps11, "ANT", x0 + wl + gap, 56, 1.6f, 0, SCR_H, ink_text_px, &c);
+        ink_diamond(ink, x0 + wl + gap / 2.0f, 52, 2.0f);
     }
 
     rosette(ink, rcx, rcy, seed);
@@ -276,20 +280,17 @@ void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *mr, in
     int sh = p->shares > 0 ? p->shares : 1;
     if (sh <= 10) snprintf(share, sizeof share, "%s SHARE%s", NUMW[sh], sh > 1 ? "S" : "");
     else snprintf(share, sizeof share, "%d SHARES", sh);
-    ink_text(ink, &font_caps13, share, cx, 206, 2.2f);
+    ink_text(ink, &font_caps13, share, cx, 216, 2.2f);
 
     /* separator */
-    ink_seg(ink, 26, 216.5f, 76, 216.5f, 0.9f);
-    ink_seg(ink, 94, 216.5f, 144, 216.5f, 0.9f);
-    ink_diamond(ink, 85, 216.5f, 2.6f);
+    ink_seg(ink, 28, 226.5f, 76, 226.5f, 0.9f);
+    ink_seg(ink, 94, 226.5f, 142, 226.5f, 0.9f);
+    ink_diamond(ink, 85, 226.5f, 2.6f);
 
     /* price */
     char price[24];
     snprintf(price, sizeof price, "$%.2f", p->price);
-    const bool ins = p->inscription[0] != 0;
-    /* with an inscription there is one more line: everything below the rule moves up */
-    const int y_price = ins ? 245 : 249, y_date = ins ? 264 : 270, y_time = ins ? 278 : 285;
-    ink_text(ink, &font_caps26, price, cx, y_price, 1.0f);
+    ink_text(ink, &font_caps26, price, cx, 258, 1.0f);
 
     /* date and time */
     char date[24], hm[8], hm_et[8];
@@ -297,37 +298,17 @@ void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *mr, in
     fmt_date(bj, date, sizeof date);
     fmt_hm(bj, hm, sizeof hm);
     fmt_hm(et, hm_et, sizeof hm_et);
-    ink_text(ink, &font_caps13, date, cx, y_date, 2.0f);
+    ink_text(ink, &font_caps13, date, cx, 279, 2.0f);
     {
         char l[16], r[16];
         snprintf(l, sizeof l, "%s BJT", hm);
         snprintf(r, sizeof r, "%s ET", hm_et);
-        int wl = text_width(&font_caps11, l, 1.2f), wr = text_width(&font_caps11, r, 1.2f);
-        int gap = 16, x0 = cx - (wl + gap + wr) / 2;
+        int wl = text_width(&font_caps11, l, 0.8f), wr = text_width(&font_caps11, r, 0.8f);
+        int gap = 14, x0 = cx - (wl + gap + wr) / 2;
         inktx_t c = { ink, 1.0f };
-        text_walk(&font_caps11, l, x0, y_time, 1.2f, 0, SCR_H, ink_text_px, &c);
-        text_walk(&font_caps11, r, x0 + wl + gap, y_time, 1.2f, 0, SCR_H, ink_text_px, &c);
-        ink_diamond(ink, x0 + wl + gap / 2.0f, y_time - 4, 1.8f);
-    }
-
-    /* inscription / serial */
-    char ser[24];
-    snprintf(ser, sizeof ser, "NO %04X %04X", (unsigned)(mr->serial >> 16), (unsigned)(mr->serial & 0xFFFF));
-    if (p->inscription[0]) {
-        char up[33];
-        int i = 0;
-        for (; p->inscription[i] && i < 32; i++) {
-            char c = p->inscription[i];
-            up[i] = (c >= 'a' && c <= 'z') ? c - 32 : c;
-        }
-        up[i] = 0;
-        /* tighten the letter spacing until it fits inside the bevel */
-        float tr = 1.2f;
-        while (tr > -0.6f && text_width(&font_caps11, up, tr) > 138) tr -= 0.2f;
-        ink_text(ink, &font_caps11, up, cx, 292, tr);
-        ink_text(ink, &font_caps11, ser, cx, 305, 1.6f);
-    } else {
-        ink_text(ink, &font_caps11, ser, cx, 304, 1.6f);
+        text_walk(&font_caps11, l, x0, 294, 0.8f, 0, SCR_H, ink_text_px, &c);
+        text_walk(&font_caps11, r, x0 + wl + gap, 294, 0.8f, 0, SCR_H, ink_text_px, &c);
+        ink_diamond(ink, x0 + wl + gap / 2.0f, 290, 1.8f);
     }
 
     /* ---- combine: grooves are cut into the base height; the cartouche is a low dome */
@@ -347,23 +328,20 @@ void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *mr, in
             buf[i] = (uint8_t)(v | (a > 0.42f ? IG_RECESS : 0));
         }
 
-    ingot_front_layout(lay, ins);
+    ingot_front_layout(lay, false);
 }
 
 void ingot_front_layout(ingot_layout_t *lay, bool inscription)
 {
-    lay->rcx = 85; lay->rcy = 124; lay->rmax = 64;
+    (void)inscription;
+    lay->rcx = 85; lay->rcy = 134; lay->rmax = 64;
     stamp_band_t b[] = {
-        { 15, 52, 0, 0.8f },     /* ANTHROPIC / NASDAQ ANT */
-        { 191, 222, 0, 0.8f },   /* ONE SHARE + separator */
-        { 223, 254, 0, 1.4f },   /* price: the heavy blow */
-        { 255, 290, 0, 0.9f },   /* date + time */
-        { 291, 314, 0, 0.7f },   /* inscription / serial */
+        { 24, 60, 0, 0.8f },     /* ANTHROPIC / NASDAQ ANT */
+        { 200, 231, 0, 0.8f },   /* ONE SHARE + separator */
+        { 232, 263, 0, 1.4f },   /* price: the heavy blow */
+        { 264, 299, 0, 0.9f },   /* date + time */
     };
-    if (inscription) {
-        b[2].y1 = 250; b[3].y0 = 251; b[3].y1 = 282; b[4].y0 = 283; b[4].y1 = 312;
-    }
-    lay->nbands = 5;
+    lay->nbands = 4;
     memcpy(lay->bands, b, sizeof b);
 }
 

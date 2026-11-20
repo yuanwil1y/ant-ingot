@@ -17,7 +17,8 @@
 #define BAR_X1 167
 #define BAR_Y1 317
 #define BAR_R 16
-#define BAR_BEVEL 8
+#define BAR_BEVEL 12
+#define FRAME_IN 16.5f      /* engraved frame line, distance from the outer edge */
 
 typedef struct { int y0, y1; float t; float weight; } stamp_band_t;
 

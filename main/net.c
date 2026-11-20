@@ -689,13 +689,6 @@ static esp_err_t h_setup(httpd_req_t *r)
         const char *t = jstr(j, "time");
         p.buy_ts = t ? parse_local(t) : 0;
         p.shares = (int)jnum(j, "shares", 1);
-        const char *ins = jstr(j, "inscription");
-        if (ins) {
-            int o = 0;
-            for (const char *q = ins; *q && o < 18; q++)
-                if (*q >= 32 && *q <= 126) p.inscription[o++] = (char)toupper((unsigned char)*q);
-            p.inscription[o] = 0;
-        }
         if (p.price <= 0 || p.price > 100000 || p.buy_ts < 1790000000 || p.shares < 1 || p.shares > 100000) {
             cJSON_Delete(j);
             cJSON_AddStringToObject(res, "error", "Please check the price, time and share count.");
