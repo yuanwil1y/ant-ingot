@@ -165,6 +165,15 @@ static struct {
     int tx, ty;
 } s_in;
 static float s_thresh = 1.1f;
+static volatile float s_meter_peak;
+static volatile int64_t s_meter_t;
+static volatile uint32_t s_meter_count;
+
+void hw_shake_meter(float *peak, uint32_t *count)
+{
+    *peak = s_meter_peak;
+    *count = s_meter_count;
+}
 
 static esp_err_t reg_write(i2c_master_dev_handle_t d, uint8_t r, uint8_t v)
 {
@@ -191,9 +200,8 @@ static bool imu_init(void)
         vTaskDelay(pdMS_TO_TICKS(20));
         reg_write(s_imu, 0x02, 0x40);         /* CTRL1: auto-increment, little endian */
         reg_write(s_imu, 0x03, 0x25);         /* CTRL2: accel +-8g, ~250 Hz */
-        reg_write(s_imu, 0x04, 0x55);         /* CTRL3: gyro +-512 dps, ~250 Hz */
         reg_write(s_imu, 0x06, 0x00);         /* CTRL5: no LPF tweaks */
-        reg_write(s_imu, 0x08, 0x03);         /* CTRL7: accel + gyro on */
+        reg_write(s_imu, 0x08, 0x01);         /* CTRL7: accel only */
         return true;
     }
     ESP_LOGW(TAG, "IMU not found");
@@ -208,21 +216,20 @@ static void input_task(void *arg)
     bool btn_prev = false, long_sent = false;
     int tick = 0;
     const float dt = 0.005f;
-    const float DPS = 3.14159265f / 180 / 64.0f;     /* +-512 dps: 64 LSB per dps → rad/s */
     TickType_t wake = xTaskGetTickCount();
     for (;;) {
         int64_t now = esp_timer_get_time();
         /* ---- accelerometer + gyro */
         if (s_imu) {
-            uint8_t b[12];
-            if (reg_read(s_imu, 0x35, b, 12) == ESP_OK) {
-                float a[3], w[3];
-                for (int i = 0; i < 3; i++) {
-                    a[i] = (int16_t)(b[2 * i] | (b[2 * i + 1] << 8)) / 4096.0f;
-                    w[i] = (int16_t)(b[6 + 2 * i] | (b[6 + 2 * i + 1] << 8)) * DPS;
-                }
+            uint8_t b[6];
+            if (reg_read(s_imu, 0x35, b, 6) == ESP_OK) {
+                float a[3];
+                for (int i = 0; i < 3; i++) a[i] = (int16_t)(b[2 * i] | (b[2 * i + 1] << 8)) / 4096.0f;
                 motion_out_t o;
-                motion_step(&mo, a, w, dt, now, s_thresh, &o);
+                motion_step(&mo, a, NULL, dt, now, s_thresh, &o);
+                /* shake meter: strongest swing in the last 3 s, and how many shakes were seen */
+                if (o.lin > s_meter_peak || now - s_meter_t > 3000000) { s_meter_peak = o.lin; s_meter_t = now; }
+                if (o.shake) { s_meter_count++; ESP_LOGI(TAG, "shake (peak %.2f g)", s_meter_peak); }
                 taskENTER_CRITICAL(&s_mux);
                 s_in.energy = o.energy;
                 s_in.gx = o.gx;

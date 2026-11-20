@@ -25,6 +25,7 @@ typedef struct {
     bool btn_short, btn_long;
 } hw_input_t;
 void hw_inputs_take(hw_input_t *out, const tune_t *tune);
+void hw_shake_meter(float *peak_g, uint32_t *shakes);   /* strongest swing in the last 3 s */
 
 void hw_led_init(void);
 void hw_led_set(uint8_t r, uint8_t g, uint8_t b);

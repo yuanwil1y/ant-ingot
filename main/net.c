@@ -20,6 +20,7 @@
 #include "dns_server.h"
 #include "ingot.h"
 #include "market.h"
+#include "hw.h"
 
 static const char *TAG = "net";
 
@@ -709,6 +710,12 @@ static esp_err_t h_state(httpd_req_t *r)
     if (M->quote.valid) cJSON_AddNumberToObject(j, "price", M->quote.price);
     add_tune(cJSON_AddObjectToObject(j, "tune"), &M->tune);
     UNLOCK();
+    float peak;
+    uint32_t shakes;
+    hw_shake_meter(&peak, &shakes);
+    cJSON *mo = cJSON_AddObjectToObject(j, "motion");
+    cJSON_AddNumberToObject(mo, "peak", peak);
+    cJSON_AddNumberToObject(mo, "shakes", shakes);
     return send_json(r, j);
 }
 

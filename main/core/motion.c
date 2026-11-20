@@ -2,7 +2,7 @@
 #include <math.h>
 #include <string.h>
 
-#define SHAKE_SWINGS 3          /* back, forth, back */
+#define SHAKE_SWINGS 2          /* back and forth */
 #define SWING_GAP_US 450000     /* max time between swings */
 #define NORM_DEV_MIN 0.35f      /* a swing must push |a| this far from 1 g */
 
@@ -57,5 +57,6 @@ void motion_step(motion_t *m, const float a[3], const float *w, float dt, int64_
     if (gn < 0.2f) gn = 1;
     out->shake = ev;
     out->energy = m->energy;
+    out->lin = mag;
     out->gx = m->g[0] / gn; out->gy = m->g[1] / gn; out->gz = m->g[2] / gn;
 }

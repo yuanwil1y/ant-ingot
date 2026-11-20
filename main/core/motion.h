@@ -1,10 +1,10 @@
 /* Telling a shake from picking the bar up to look at it.
  *
- * Gravity is tracked with the gyro (a complementary filter), so turning the bar over
- * does not look like acceleration. What remains is real linear acceleration; a shake
- * is three or more strong, alternating swings of it in quick succession, each of
- * which also pushes the total acceleration well away from 1 g. Rotation alone never
- * does that, however fast.
+ * A shake is two strong, alternating swings of linear acceleration in quick
+ * succession, each of which also pushes the total acceleration well away from 1 g.
+ * Turning the bar over, however fast, keeps |a| at 1 g, so it never counts.
+ * Gyro-tracked gravity is supported (pass w) but the firmware passes NULL: the
+ * board's gyro scale could not be verified and a wrong scale hides real shakes.
  */
 #pragma once
 #include <stdint.h>
@@ -24,6 +24,7 @@ typedef struct {
 typedef struct {
     bool shake;
     float energy;
+    float lin;              /* |linear accel| this sample, g (for the shake meter) */
     float gx, gy, gz;
 } motion_out_t;
 

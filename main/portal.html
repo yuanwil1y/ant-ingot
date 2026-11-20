@@ -88,6 +88,7 @@ button.ghost{background:none;color:var(--ink);border:1px solid var(--rule);lette
   <div class="t"><span>Days held</span><b id="sDay"></b></div>
 
   <h2>FEEL</h2>
+  <div class="note" id="meter" style="text-align:center">Shake the bar to test.</div>
   <div id="sliders"></div>
   <div class="row"><div><button class="ghost" id="rehearse">REHEARSE MINT</button></div><div><button class="ghost" id="reset">DEFAULTS</button></div></div>
   <button id="saveFeel">SAVE FEEL</button>
@@ -190,6 +191,8 @@ function initSettings(){
   fillScan($('ssidSel2'),$('ssid2'),S.ssid);
 }
 function updateSettings(){
+  if(S.motion){const th=S.tune.shake_g;
+    $('meter').innerHTML='Shake meter: last 3 s peak <b>'+S.motion.peak.toFixed(2)+' g</b> (needs '+th.toFixed(2)+' g) · shakes seen: <b>'+S.motion.shakes+'</b>';}
   const p=S.purchase;
   $('sPrice').textContent='$'+p.price.toFixed(2)+(p.shares>1?' × '+p.shares:'');
   $('sTime').textContent=bj(p.buy_ts)+' BJT';
@@ -204,7 +207,7 @@ $('saveNet').onclick=()=>{
 };
 $('done').onclick=()=>api('/api/exit',{}).then(()=>{document.body.innerHTML='<div class="cert"><div class="big">Settings closed.</div></div>'});
 
-function poll(){api('/api/state').then(s=>{S=s;render()}).catch(()=>{}).finally(()=>setTimeout(poll,mode==='progress'?700:3000))}
+function poll(){api('/api/state').then(s=>{S=s;render()}).catch(()=>{}).finally(()=>setTimeout(poll,mode==='progress'||mode==='settings'?700:3000))}
 poll();
 </script>
 </body>
