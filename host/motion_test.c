@@ -148,6 +148,38 @@ static void lazy_shake(float t, float e[3], float lw[3])
     lw[0] = on * 1.15f * sinf(2 * 3.14159f * 2.8f * t); lw[1] = 0; lw[2] = on * 0.2f * sinf(2 * 3.14159f * 2.8f * t);
 }
 
+/* how people actually shake things: the wrist twists back and forth (about 35 deg, 4 Hz) and the
+   bar, held a few cm from the wrist's axis, is thrown sideways at each end of the twist */
+static void twist_shake(float t, float e[3], float lw[3])
+{
+    float on = t > 0.3f && t < 1.3f ? 1 : 0;
+    float w = 2 * 3.14159f * 4.0f;
+    e[0] = -60 * DEG; e[1] = on * 35 * DEG * sinf(w * t); e[2] = 0;
+    float r = 0.08f / 9.81f;                         /* 8 cm lever, in g per (rad/s^2) */
+    float ang_acc = -on * 35 * DEG * w * w * sinf(w * t);
+    float ang_vel = on * 35 * DEG * w * cosf(w * t);
+    lw[0] = r * ang_acc; lw[1] = 0; lw[2] = -r * ang_vel * ang_vel;
+}
+/* a gentler twist, about 20 deg */
+static void soft_twist(float t, float e[3], float lw[3])
+{
+    float on = t > 0.3f && t < 1.5f ? 1 : 0;
+    float w = 2 * 3.14159f * 3.5f;
+    e[0] = -60 * DEG; e[1] = on * 22 * DEG * sinf(w * t); e[2] = 0;
+    float r = 0.07f / 9.81f;
+    float ang_acc = -on * 22 * DEG * w * w * sinf(w * t);
+    float ang_vel = on * 22 * DEG * w * cosf(w * t);
+    lw[0] = r * ang_acc; lw[1] = 0; lw[2] = -r * ang_vel * ang_vel;
+}
+/* put it down on the desk with a clack */
+static void put_down(float t, float e[3], float lw[3])
+{
+    float u = t < 0.6f ? t / 0.6f : 1;
+    e[0] = -60 * DEG * (1 - u); e[1] = 0; e[2] = 0;
+    lw[0] = 0; lw[1] = 0;
+    lw[2] = t < 0.5f ? -0.3f * sinf(3.14159f * t / 0.5f) : (t < 0.53f ? 2.5f : (t < 0.56f ? -0.8f : 0));
+}
+
 int main(void)
 {
     int bad = 0;
@@ -157,9 +189,12 @@ int main(void)
         bad += run("snatch up + quick look at back", snatch, 2.5f, g) != 0;
         bad += run("fidgeting in the hand (6 s)", fidget, 6, g) != 0;
         bad += run("quick peek at the back (x4)", peek, 4.8f, g) != 0;
+        bad += run("put it down with a clack", put_down, 1.5f, g) != 0;
         bad += run("hard shake (0.8 s)", shake, 1.6f, g) == 0;
         bad += run("gentle shake (1 s)", soft_shake, 1.8f, g) == 0;
         bad += run("lazy shake (2.8 Hz, 1.15 g)", lazy_shake, 1.8f, g) == 0;
+        bad += run("wrist-twist shake (35 deg, 4 Hz)", twist_shake, 1.6f, g) == 0;
+        bad += run("soft wrist twist (22 deg, 3.5 Hz)", soft_twist, 1.8f, g) == 0;
     }
     printf(bad ? "FAIL (%d)\n" : "all good\n", bad);
     return bad;

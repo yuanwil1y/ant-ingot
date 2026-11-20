@@ -262,7 +262,7 @@ static void input_task(void *arg)
                 motion_step(&mo, a, NULL, dt, now, s_thresh, &o);
                 /* shake meter: strongest swing in the last 3 s, and how many shakes were seen */
                 if (o.lin > s_meter_peak || now - s_meter_t > 3000000) { s_meter_peak = o.lin; s_meter_t = now; }
-                if (o.shake) { s_meter_count++; ESP_LOGI(TAG, "shake (peak %.2f g)", s_meter_peak); }
+                if (o.shake) { s_meter_count++; ESP_LOGI(TAG, "shake (strongest jolt %.2f g from 1 g)", s_meter_peak); }
                 taskENTER_CRITICAL(&s_mux);
                 s_in.energy = o.energy;
                 s_in.gx = o.gx;

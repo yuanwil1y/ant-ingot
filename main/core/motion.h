@@ -1,10 +1,10 @@
 /* Telling a shake from picking the bar up to look at it.
  *
- * A shake is two strong, alternating swings of linear acceleration in quick
- * succession, each of which also pushes the total acceleration well away from 1 g.
- * Turning the bar over, however fast, keeps |a| at 1 g, so it never counts.
- * Gyro-tracked gravity is supported (pass w) but the firmware passes NULL: the
- * board's gyro scale could not be verified and a wrong scale hides real shakes.
+ * Only the size of the total acceleration is used, never its direction: turning the
+ * bar over (however fast) keeps |a| at 1 g, so it can never look like a shake, and
+ * there is no gravity estimate to fall behind when the wrist twists. A shake is a
+ * run of jolts: |a| leaves 1 g by a margin three or more separate times within
+ * 0.6 s. Lifting, putting down or snatching the bar up makes one or two.
  */
 #pragma once
 #include <stdint.h>
@@ -15,18 +15,17 @@ typedef struct {
     float g[3];             /* gravity estimate, device frame, g */
     float bias[3];          /* gyro bias, rad/s */
     float energy;           /* smoothed |linear accel|, g */
-    int64_t last_peak_us;
-    float last_dir[3];
-    int count;
-    bool armed;
-    /* the swing in progress (between crossing the threshold and falling back) */
-    float sw_mag, sw_dev, sw_dir[3];
+    /* jolts: |a| away from 1 g */
+    bool in_jolt;
+    int jolt_len;
+    int64_t jolts[8];
+    int nj;
 } motion_t;
 
 typedef struct {
     bool shake;
     float energy;
-    float lin;              /* |linear accel| this sample, g (for the shake meter) */
+    float lin;              /* how far |a| is from 1 g this sample (for the shake meter) */
     float gx, gy, gz;
 } motion_out_t;
 

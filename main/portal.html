@@ -192,7 +192,7 @@ function initSettings(){
 }
 function updateSettings(){
   if(S.motion){const th=S.tune.shake_g;
-    $('meter').innerHTML='Shake meter: last 3 s peak <b>'+S.motion.peak.toFixed(2)+' g</b> (needs '+th.toFixed(2)+' g) · shakes seen: <b>'+S.motion.shakes+'</b>'+
+    $('meter').innerHTML='Shake meter: strongest jolt in the last 3 s <b>'+S.motion.peak.toFixed(2)+' g</b> away from 1 g (a jolt needs '+(th*0.42).toFixed(2)+' g; a shake is 3 jolts in 0.6 s) · shakes seen: <b>'+S.motion.shakes+'</b>'+
       (S.motion.rest>0?'<br>Sensor at rest read <b>'+S.motion.rest.toFixed(2)+' g</b> before correction (1.00 = as configured)':'');}
   const p=S.purchase;
   $('sPrice').textContent='$'+p.price.toFixed(2)+(p.shares>1?' × '+p.shares:'');
