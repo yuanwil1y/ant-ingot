@@ -102,6 +102,9 @@ static struct {
     assay_t as_new;
     float furnace;              /* 0..1 market-open glow */
     float zglow;                /* current glow strength 0..1 */
+    uint8_t *zblur;             /* softened letter mask, for the heat halo */
+    uint16_t lava[256];         /* molten colours from embers to white-hot */
+    int lava_mode;              /* 0 none, 1 hot (above cost), 2 cooler (below), 3 melting */
     int zglow_r, zglow_g, zglow_b;
     float zscroll;
 
@@ -476,6 +479,52 @@ static bool zone_alloc(void)
     return S.zink_a && S.zink_b && S.zbuf && ZH_TMP && ZBASE;
 }
 
+/* Soft halo source: the letter mask box-blurred (radius 3, two passes). */
+static void zblur_build(void)
+{
+    if (!S.zblur) S.zblur = calloc(ZONE_H, SCR_W);
+    if (!S.zblur || !S.zink_a) return;
+    static uint8_t tmp[ZONE_H * SCR_W];
+    const int R = 3, n = 2 * R + 1;
+    for (int y = 0; y < ZONE_H; y++) {
+        const uint8_t *src = S.zink_a + y * SCR_W;
+        int acc = 0;
+        for (int x = -R; x <= R; x++) acc += (x >= 0 && x < SCR_W) ? src[x] : 0;
+        for (int x = 0; x < SCR_W; x++) {
+            tmp[y * SCR_W + x] = (uint8_t)(acc / n);
+            int xo = x - R, xi = x + R + 1;
+            acc += (xi < SCR_W ? src[xi] : 0) - (xo >= 0 ? src[xo] : 0);
+        }
+    }
+    for (int x = 0; x < SCR_W; x++) {
+        int acc = 0;
+        for (int y = -R; y <= R; y++) acc += (y >= 0 && y < ZONE_H) ? tmp[y * SCR_W + x] : 0;
+        for (int y = 0; y < ZONE_H; y++) {
+            int v = acc * 2 / n;                    /* a little gain so the halo reads */
+            S.zblur[y * SCR_W + x] = (uint8_t)(v > 255 ? 255 : v);
+            int yo = y - R, yi = y + R + 1;
+            acc += (yi < ZONE_H ? tmp[yi * SCR_W + x] : 0) - (yo >= 0 ? tmp[yo * SCR_W + x] : 0);
+        }
+    }
+}
+
+static void lava_build(int mode)
+{
+    if (mode == S.lava_mode) return;
+    S.lava_mode = mode;
+    float t0 = 0.30f, t1 = 0.78f;                       /* hot: deep orange → yellow-white */
+    if (mode == 2) { t0 = 0.20f; t1 = 0.55f; }          /* below cost: embers → orange */
+    if (mode == 3) { t0 = 0.45f; t1 = 0.95f; }          /* melting: bright */
+    for (int i = 0; i < 256; i++) {
+        float u = i / 255.0f;
+        u = u * u * (3 - 2 * u);
+        float r, g, b;
+        blackbody(t0 + (t1 - t0) * u, &r, &g, &b);
+        float k = 0.75f + 0.25f * u;
+        S.lava[i] = rgb565((int)(r * 255 * k), (int)(g * 255 * k), (int)(b * 255 * k));
+    }
+}
+
 /* Show a weighing immediately (no ceremony). */
 static void zone_show(double price, double grams)
 {
@@ -487,6 +536,7 @@ static void zone_show(double price, double grams)
     S.zm_a = 1;
     S.zm_b1 = S.zm_b2 = 0;
     zbuild();
+    zblur_build();
 }
 
 /* The latest official close we know of, as an ET day index. */
@@ -558,6 +608,7 @@ static void zone_tick(float dt)
         if (t >= 1.5f && t - dt < 1.5f) glint_start(0.7f, 36, 20, 6, 8, 0);
         if (t >= 2.4f) {
             memcpy(S.zink_a, S.zink_b, ZONE_H * SCR_W);
+            zblur_build();
             S.zm_a = 1;
             S.zm_b1 = S.zm_b2 = 0;
             m->assay = S.as_new;
@@ -576,15 +627,16 @@ static void zone_tick(float dt)
     }
     /* glow colour: open → hot when above cost, a dull red when below; melting → bright */
     float er, eg, eb, k;
-    if (melt > 0) { blackbody(0.7f, &er, &eg, &eb); k = melt; }
+    if (melt > 0) { blackbody(0.7f, &er, &eg, &eb); k = melt; lava_build(3); }
     else {
         bool up = m->quote.valid && m->quote.price >= m->mint.p.price;
-        blackbody(up ? 0.6f : 0.36f, &er, &eg, &eb);
-        k = S.furnace * 0.62f;
+        blackbody(up ? 0.62f : 0.45f, &er, &eg, &eb);
+        k = S.furnace;
+        lava_build(up ? 1 : 2);
     }
     S.zglow = k;
     S.zglow_r = (int)(er * 255); S.zglow_g = (int)(eg * 255); S.zglow_b = (int)(eb * 255);
-    S.zscroll += dt * 9;
+    S.zscroll += dt * 14;
 }
 
 /* ================================================================== renderers */
@@ -636,6 +688,7 @@ static void render_metal_k(strip_t *st, const uint8_t *buf, const uint16_t *lut,
         const uint8_t *F = zrow ? S.zbuf + zr * SCR_W : buf + sy * SCR_W;
         const uint8_t *Bb = B + sy * SCR_W;
         const uint8_t *zi = (zrow && !minting && zg) ? S.zink_a + zr * SCR_W : NULL;
+        const uint8_t *zb = (zi && S.zblur) ? S.zblur + zr * SCR_W : zi;
         const uint8_t *nrow = NOISE[(zr + 640 - zs) & 63];
         int ptaper = zrow ? (zr < 14 ? zr * 18 : (ZONE_H - 1 - zr < 14 ? (ZONE_H - 1 - zr) * 18 : 256)) : 0;
         int zpool_row = zpool * ptaper >> 8;
@@ -667,12 +720,20 @@ static void render_metal_k(strip_t *st, const uint8_t *buf, const uint16_t *lut,
                 c = add565(c, hh, hh * 6 / 10, hh / 5);
             }
             if (zi) {
+                int n = nrow[(x + (zs >> 2)) & 63];
                 int ink = zi[x] * zma >> 8;
                 int xt = x < 40 ? (x - 18) * 12 : (x > 130 ? (152 - x) * 12 : 256);
                 if (xt < 0) xt = 0;
                 if (xt > 256) xt = 256;
-                int e = ((ink + (zpool_row * xt >> 8)) * zg >> 8) * (96 + nrow[(x + (zs >> 2)) & 63]) >> 8;
+                /* heat halo around the letters (and the molten pool while re-casting) */
+                int halo = ((zb[x] * zma >> 8) * 150 >> 8) + (zpool_row * xt >> 8);
+                int e = (halo * zg >> 8) * (128 + n) >> 8;
                 if (e) c = add565(c, S.zglow_r * e >> 8, S.zglow_g * e >> 8, S.zglow_b * e >> 8);
+                /* inside the letters: the metal itself is molten, flowing between embers and white heat */
+                if (ink) {
+                    int heat = (n * 3 + nrow[(x * 3 + 17 + zs) & 63]) >> 2;
+                    c = blend565(c, S.lava[heat], (ink * zg >> 8) * 235 >> 8);
+                }
             }
             o[x] = c;
         }
