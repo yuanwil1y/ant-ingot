@@ -22,11 +22,31 @@ typedef struct {
 
 typedef struct {
     bool valid;
-    double price, prev_close, high, low, chg_pct;
+    double price, prev_close, open, high, low, chg_pct, volume;
     double total_shares;
+    double ext_price, ext_pct;  /* pre-market / after-hours, 0 if none */
     char when[24];          /* exchange time, e.g. "2026-11-19 16:00:01" (ET) */
     int64_t fetched_ts;
 } quote_t;
+
+/* Today's minute prices (regular session) and longer daily/weekly closes. */
+#define INTRA_MAX 400
+#define SERIES_MAX 300
+
+typedef struct {
+    int n;
+    int date;                   /* yyyymmdd (ET) */
+    int16_t min[INTRA_MAX];     /* minutes since 09:30 ET */
+    float px[INTRA_MAX];
+    uint32_t rev;               /* bumps on every update */
+} intraday_t;
+
+typedef struct {
+    int n;
+    int32_t day[SERIES_MAX];    /* days since 1970-01-01 */
+    float close[SERIES_MAX];
+    uint32_t rev;
+} series_t;
 
 /* Pre-mint setup progress, driven by the captive portal. */
 typedef enum { SETUP_WAITING = 0, SETUP_CHECKING, SETUP_FAILED, SETUP_READY } setup_stage_t;
@@ -74,6 +94,8 @@ typedef struct {
     mint_rec_t mint;
     setup_t setup;
     quote_t quote;
+    intraday_t intra;
+    series_t daily;             /* daily closes, or weekly once the history outgrows SERIES_MAX */
     char line[160];         /* today's DeepSeek line */
     int  line_day;          /* day number (held) the line belongs to, 0 = none */
     int  line_seen_day;     /* last day whose line finished engraving on screen */

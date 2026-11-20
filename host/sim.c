@@ -39,13 +39,30 @@ int main(int argc, char **argv)
     snprintf(M.quote.when, sizeof M.quote.when, "2026-11-20 10:31:02");
     snprintf(M.line, sizeof M.line, "Day one. The price wobbled; I did not. Gold is patient by design.");
     M.line_day = 1;
-    bool minted_start = !strcmp(script, "faces");
+    bool market = !strcmp(script, "market");
+    bool minted_start = !strcmp(script, "faces") || market;
+    if (market) {
+        M.setup.pending.price = 88.00; M.setup.pending.buy_ts = 1795185000;
+        snprintf(M.setup.pending.inscription, sizeof M.setup.pending.inscription, "FOR THE LONG RUN.");
+        M.now = 1795185000 + 13200;
+        FILE *f = fopen("mkt.txt", "r");
+        char tag;
+        while (f && fscanf(f, " %c", &tag) == 1) {
+            if (tag == 'I') fscanf(f, "%d", &M.intra.date);
+            else if (tag == 'M') { int mi; float px; fscanf(f, "%d %f", &mi, &px); M.intra.min[M.intra.n] = mi; M.intra.px[M.intra.n++] = px; }
+            else if (tag == 'D') { int d; float c; fscanf(f, "%d %f", &d, &c); M.daily.day[M.daily.n] = d; M.daily.close[M.daily.n++] = c; }
+            else if (tag == 'Q') fscanf(f, "%lf %lf %lf %lf %lf %lf %lf", &M.quote.price, &M.quote.prev_close, &M.quote.open, &M.quote.high, &M.quote.low, &M.quote.chg_pct, &M.quote.volume);
+        }
+        if (f) fclose(f);
+        M.intra.rev = M.daily.rev = 1;
+        M.line_day = 1;
+    }
     if (minted_start) { M.mint.minted = 1; M.mint.p = M.setup.pending; M.patina_day = 1; }
     if (!scene_init(&M)) { fprintf(stderr, "init failed\n"); return 1; }
     const float dt = 1.0f / 30;
     float t = 0;
     int nframes = 0;
-    float end = minted_start ? 30 : 46;
+    float end = market ? 16 : (minted_start ? 30 : 46);
     while (t < end) {
         input_t in = { 0 };
         if (!minted_start) {
@@ -59,6 +76,15 @@ int main(int argc, char **argv)
             if (t >= 5.5f && M.setup.stage != SETUP_READY && !M.mint.minted) M.setup.stage = SETUP_READY;
             /* shaking from 7.5s for ~2s, with a pause in the middle */
             if (t > 7.5f && t < 10.2f && !(t > 8.4f && t < 8.8f)) in.shake_energy = 1.4f + 0.4f * sinf(t * 9);
+        }
+        if (market) {
+            if (fabsf(t - 1.0f) < dt / 2 || fabsf(t - 3.5f) < dt / 2) in.shake = 1;
+            if ((t > 7.0f && t < 7.1f) || (t > 10.0f && t < 10.1f) || (t > 13.0f && t < 13.1f)) { in.touch = 1; in.tx = 85; in.ty = 160; }
+            scene_tick(dt, &in);
+            scene_take_events();
+            frame(stdout, scale);
+            t += dt;
+            continue;
         }
         float o = minted_start ? -13.5f : 0;   /* faces script starts at the front face */
         float tt = t - o;

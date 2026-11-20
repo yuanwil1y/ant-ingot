@@ -167,7 +167,7 @@ static int64_t days_from_civil(int y, int m, int d)
 }
 
 /* US Eastern offset in seconds at a UTC instant (DST: 2nd Sun Mar 07:00Z .. 1st Sun Nov 06:00Z) */
-static int et_offset(int64_t utc)
+int us_et_offset(int64_t utc)
 {
     int Y, M, D;
     civil(utc / 86400, &Y, &M, &D);
@@ -292,15 +292,18 @@ void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *mr, in
     /* price */
     char price[24];
     snprintf(price, sizeof price, "$%.2f", p->price);
-    ink_text(ink, &font_caps26, price, cx, 249, 1.0f);
+    const bool ins = p->inscription[0] != 0;
+    /* with an inscription there is one more line: everything below the rule moves up */
+    const int y_price = ins ? 245 : 249, y_date = ins ? 264 : 270, y_time = ins ? 278 : 285;
+    ink_text(ink, &font_caps26, price, cx, y_price, 1.0f);
 
     /* date and time */
     char date[24], hm[8], hm_et[8];
-    int64_t bj = p->buy_ts + LOCAL_UTC_OFFSET, et = p->buy_ts + et_offset(p->buy_ts);
+    int64_t bj = p->buy_ts + LOCAL_UTC_OFFSET, et = p->buy_ts + us_et_offset(p->buy_ts);
     fmt_date(bj, date, sizeof date);
     fmt_hm(bj, hm, sizeof hm);
     fmt_hm(et, hm_et, sizeof hm_et);
-    ink_text(ink, &font_caps13, date, cx, 270, 2.0f);
+    ink_text(ink, &font_caps13, date, cx, y_date, 2.0f);
     {
         char l[16], r[16];
         snprintf(l, sizeof l, "%s BJT", hm);
@@ -308,9 +311,9 @@ void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *mr, in
         int wl = text_width(&font_caps11, l, 1.2f), wr = text_width(&font_caps11, r, 1.2f);
         int gap = 16, x0 = cx - (wl + gap + wr) / 2;
         inktx_t c = { ink, 1.0f };
-        text_walk(&font_caps11, l, x0, 285, 1.2f, 0, SCR_H, ink_text_px, &c);
-        text_walk(&font_caps11, r, x0 + wl + gap, 285, 1.2f, 0, SCR_H, ink_text_px, &c);
-        ink_diamond(ink, x0 + wl + gap / 2.0f, 281, 1.8f);
+        text_walk(&font_caps11, l, x0, y_time, 1.2f, 0, SCR_H, ink_text_px, &c);
+        text_walk(&font_caps11, r, x0 + wl + gap, y_time, 1.2f, 0, SCR_H, ink_text_px, &c);
+        ink_diamond(ink, x0 + wl + gap / 2.0f, y_time - 4, 1.8f);
     }
 
     /* inscription / serial */
@@ -324,8 +327,11 @@ void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *mr, in
             up[i] = (c >= 'a' && c <= 'z') ? c - 32 : c;
         }
         up[i] = 0;
-        ink_text(ink, &font_caps11, up, cx, 299, 1.2f);
-        ink_text(ink, &font_caps11, ser, cx, 311, 1.6f);
+        /* tighten the letter spacing until it fits inside the bevel */
+        float tr = 1.2f;
+        while (tr > -0.6f && text_width(&font_caps11, up, tr) > 138) tr -= 0.2f;
+        ink_text(ink, &font_caps11, up, cx, 292, tr);
+        ink_text(ink, &font_caps11, ser, cx, 305, 1.6f);
     } else {
         ink_text(ink, &font_caps11, ser, cx, 304, 1.6f);
     }
@@ -354,10 +360,10 @@ void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *mr, in
             buf[i] = (uint8_t)(v | (a > 0.42f ? IG_RECESS : 0));
         }
 
-    ingot_front_layout(lay);
+    ingot_front_layout(lay, ins);
 }
 
-void ingot_front_layout(ingot_layout_t *lay)
+void ingot_front_layout(ingot_layout_t *lay, bool inscription)
 {
     lay->rcx = 85; lay->rcy = 124; lay->rmax = 64;
     stamp_band_t b[] = {
@@ -367,6 +373,9 @@ void ingot_front_layout(ingot_layout_t *lay)
         { 255, 290, 0, 0.9f },   /* date + time */
         { 291, 314, 0, 0.7f },   /* inscription / serial */
     };
+    if (inscription) {
+        b[2].y1 = 250; b[3].y0 = 251; b[3].y1 = 282; b[4].y0 = 283; b[4].y1 = 312;
+    }
     lay->nbands = 5;
     memcpy(lay->bands, b, sizeof b);
 }
@@ -543,4 +552,29 @@ void ingot_engrave_rule(uint8_t *buf, int x0, int x1, int y)
             uint8_t *p = &buf[(y + dy) * SCR_W + cx + dx];
             if (*p) *p = (uint8_t)((int)(IG_SHADE(*p) * 0.5f) | IG_RECESS);
         }
+}
+
+mkt_t market_state(int64_t utc, int64_t *next_open, int64_t *close_at)
+{
+    int off = us_et_offset(utc);
+    int64_t et = utc + off;
+    int64_t day = et / 86400;
+    int sod = (int)(et - day * 86400);
+    int wd = (int)((day + 4) % 7);            /* 0 = Sunday */
+    int mins = sod / 60;
+    bool weekday = wd >= 1 && wd <= 5;
+    mkt_t s = MKT_CLOSED;
+    if (weekday) {
+        if (mins >= 240 && mins < 570) s = MKT_PRE;
+        else if (mins >= 570 && mins < 960) s = MKT_OPEN;
+        else if (mins >= 960 && mins < 1200) s = MKT_AFTER;
+    }
+    if (close_at) *close_at = day * 86400 + 960 * 60 - off;
+    if (next_open) {
+        int64_t d = day;
+        if (!weekday || mins >= 570) d++;
+        while (((d + 4) % 7) == 0 || ((d + 4) % 7) == 6) d++;
+        *next_open = d * 86400 + 570 * 60 - off;
+    }
+    return s;
 }

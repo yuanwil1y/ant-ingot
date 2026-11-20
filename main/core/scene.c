@@ -103,7 +103,11 @@ static struct {
     char header[40], footer[40];
     bool back_built;
 
-    /* ledger */
+    /* ledger / market face */
+    int mpage, mpage_to;
+    bool mfading;
+    float mfade_t;
+    int last_minute;
     double led_from[5], led_to[5];  /* price, chg%, value, gain%, x ipo */
     float ledger_t;
     bool ledger_anim, ledger_ready;
@@ -242,7 +246,7 @@ static void build_band_rows(void)
         for (int y = S.lay.bands[b].y0; y <= S.lay.bands[b].y1 && y < SCR_H; y++) S.band_of_row[y] = (int8_t)b;
 }
 
-#define SURF_VERSION 3u
+#define SURF_VERSION 4u
 #define BASE_SEED 0x5eedu
 
 static void ensure_base(void)
@@ -260,7 +264,7 @@ static void ensure_base(void)
 static bool ensure_front(const purchase_t *p, uint32_t serial)
 {
     if (S.front_ready && !memcmp(p, &S.front_for, sizeof *p)) return true;
-    ingot_front_layout(&S.lay);
+    ingot_front_layout(&S.lay, p->inscription[0] != 0);
     build_band_rows();
     uint32_t key = hash32(SURF_VERSION ^ hash32((uint32_t)lrint(p->price * 100)) ^ hash32((uint32_t)p->buy_ts) ^
                           hash32((uint32_t)p->shares * 31u) ^ hash32(serial));
@@ -630,24 +634,246 @@ static void odometer(strip_t *st, const font_t *f, const char *from, const char 
     }
 }
 
-static void ledger_row(strip_t *st, int y, const char *label, const char *val, uint16_t vc)
+/* ---------------------------------------------------------------- market face
+ * Black enamel window in the reverse side. Tap cycles three pages:
+ * 0 today (intraday), 1 since you bought, 2 since IPO. */
+
+#define CH_X0 22
+#define CH_Y0 110
+#define CH_W 126
+#define CH_H 90
+#define PANEL_X0 13
+#define PANEL_X1 157
+#define PANEL_Y0 13
+#define PANEL_Y1 307
+
+typedef struct { float x, v; } cpt_t;
+
+static int64_t et_day_of(int64_t utc) { return (utc + us_et_offset(utc)) / 86400; }
+
+static int ymd_to_days(int ymd)
 {
-    text_draw(st, &font_caps11, label, 26, y, 1.4f, C_GOLD_DIM, 256);
-    text_draw(st, &font_mono14, val, 145 - text_width(&font_mono14, val, 0), y, 0, vc, 256);
+    int y = ymd / 10000, m = ymd / 100 % 100, d = ymd % 100;
+    y -= m <= 2;
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int)doe - 719468;
 }
 
-static void hairline(strip_t *st, int y)
+/* Collect the points of a page's chart (x in 0..1). Returns count. */
+static int chart_points(int page, cpt_t *pt, int cap, float *ref1, float *ref2, float *mark_x, float *mark_v)
 {
-    if (y < st->y0 || y >= st->y0 + st->h) return;
-    uint16_t *o = &st->px[(y - st->y0) * SCR_W];
-    for (int x = 26; x < 145; x++) o[x] = blend565(o[x], C_GOLD_DIM, 150);
+    const model_t *m = S.m;
+    const intraday_t *in = &m->intra;
+    const series_t *se = &m->daily;
+    const purchase_t *p = &m->mint.p;
+    const quote_t *q = &m->quote;
+    int n = 0;
+    *ref1 = *ref2 = NAN;
+    *mark_x = -1;
+    *mark_v = 0;
+    if (page == 0) {
+        for (int i = 0; i < in->n && n < cap; i++) pt[n++] = (cpt_t){ in->min[i] / 390.0f, in->px[i] };
+        *ref1 = (float)p->price;
+        if (q->valid && q->prev_close > 0) *ref2 = (float)q->prev_close;
+        int64_t bd = et_day_of(p->buy_ts);
+        if (in->n && ymd_to_days(in->date) == bd) {
+            int64_t bet = p->buy_ts + us_et_offset(p->buy_ts);
+            int bm = (int)((bet % 86400) / 60) - 570;
+            if (bm >= 0 && bm <= 390) { *mark_x = bm / 390.0f; *mark_v = (float)p->price; }
+        }
+        return n;
+    }
+    if (page == 1) {
+        int64_t bd = et_day_of(p->buy_ts);
+        *ref1 = (float)p->price;
+        int cnt = 0;
+        for (int i = 0; i < se->n; i++) if (se->day[i] > bd) cnt++;
+        if (cnt < 2 && in->n && ymd_to_days(in->date) >= bd) {
+            /* young holding: use today's minutes after the purchase */
+            int bm = -1;
+            if (ymd_to_days(in->date) == bd) {
+                int64_t bet = p->buy_ts + us_et_offset(p->buy_ts);
+                bm = (int)((bet % 86400) / 60) - 570;
+            }
+            pt[n++] = (cpt_t){ 0, (float)p->price };
+            int first = -1, last = in->n - 1;
+            for (int i = 0; i < in->n; i++) if (in->min[i] >= bm) { first = i; break; }
+            if (first >= 0) {
+                float span = (float)(in->min[last] - in->min[first] + 1);
+                for (int i = first; i <= last && n < cap; i++) pt[n++] = (cpt_t){ (in->min[i] - in->min[first] + 1) / span, in->px[i] };
+            }
+        } else {
+            pt[n++] = (cpt_t){ 0, (float)p->price };
+            for (int i = 0; i < se->n && n < cap - 1; i++) if (se->day[i] > bd) pt[n++] = (cpt_t){ 0, se->close[i] };
+            if (q->valid) pt[n++] = (cpt_t){ 0, (float)q->price };
+            for (int i = 0; i < n; i++) pt[i].x = n > 1 ? (float)i / (n - 1) : 0;
+        }
+        *mark_x = 0;
+        *mark_v = (float)p->price;
+        return n;
+    }
+    /* since IPO: offer price, then every close, then now */
+    *ref1 = (float)IPO_PRICE;
+    pt[n++] = (cpt_t){ 0, (float)IPO_PRICE };
+    int64_t bd = et_day_of(p->buy_ts);
+    int buy_idx = -1;
+    for (int i = 0; i < se->n && n < cap - 1; i++) {
+        if (buy_idx < 0 && se->day[i] >= bd) buy_idx = n;
+        pt[n++] = (cpt_t){ 0, se->close[i] };
+    }
+    if (q->valid) {
+        if (!(se->n && se->day[se->n - 1] >= et_day_of(m->now > 0 ? m->now : p->buy_ts) && fabsf(se->close[se->n - 1] - (float)q->price) < 0.005f))
+            pt[n++] = (cpt_t){ 0, (float)q->price };
+    }
+    if (buy_idx < 0) buy_idx = n - 1;
+    for (int i = 0; i < n; i++) pt[i].x = n > 1 ? (float)i / (n - 1) : 0;
+    *mark_x = pt[buy_idx].x;
+    *mark_v = (float)p->price;
+    return n;
 }
 
-static void render_ledger(strip_t *st)
+static struct {
+    uint8_t *mask;          /* CH_W*CH_H: hi nibble = line, lo nibble = fill */
+    int page;
+    uint32_t rev;
+    bool ok;
+    int n;
+    float lo, hi;
+    float ref1, ref2, mark_x, mark_v, end_x, end_v;
+} CHT = { .page = -1 };
+
+static float chart_y(float v) { return CH_H - 6 - (v - CHT.lo) / (CHT.hi - CHT.lo) * (CH_H - 12); }
+
+static void build_chart(int page)
 {
-    /* rim: the brushed reverse, with a black enamel window */
+    static cpt_t pt[INTRA_MAX + 2];
+    if (!CHT.mask) CHT.mask = malloc(CH_W * CH_H);
+    if (!CHT.mask) return;
+    memset(CHT.mask, 0, CH_W * CH_H);
+    CHT.page = page;
+    CHT.rev = S.m->intra.rev * 131u + S.m->daily.rev * 7u + (uint32_t)(S.m->quote.price * 100);
+    int n = chart_points(page, pt, INTRA_MAX + 2, &CHT.ref1, &CHT.ref2, &CHT.mark_x, &CHT.mark_v);
+    CHT.n = n;
+    CHT.ok = n >= 2;
+    if (!CHT.ok) return;
+    float lo = 1e9f, hi = -1e9f;
+    for (int i = 0; i < n; i++) { lo = fminf(lo, pt[i].v); hi = fmaxf(hi, pt[i].v); }
+    if (!isnan(CHT.ref1)) { lo = fminf(lo, CHT.ref1); hi = fmaxf(hi, CHT.ref1); }
+    if (!isnan(CHT.ref2)) { lo = fminf(lo, CHT.ref2); hi = fmaxf(hi, CHT.ref2); }
+    float pad = fmaxf((hi - lo) * 0.08f, 0.05f);
+    CHT.lo = lo - pad;
+    CHT.hi = hi + pad;
+    /* line: AA distance to segments */
+    static float colmin[CH_W];
+    for (int x = 0; x < CH_W; x++) colmin[x] = 1e9f;
+    for (int i = 1; i < n; i++) {
+        float ax = pt[i - 1].x * (CH_W - 1), ay = chart_y(pt[i - 1].v);
+        float bx = pt[i].x * (CH_W - 1), by = chart_y(pt[i].v);
+        int x0 = (int)floorf(fminf(ax, bx)) - 2, x1 = (int)ceilf(fmaxf(ax, bx)) + 2;
+        int y0 = (int)floorf(fminf(ay, by)) - 2, y1 = (int)ceilf(fmaxf(ay, by)) + 2;
+        float dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+        for (int y = y0; y <= y1; y++) {
+            if (y < 0 || y >= CH_H) continue;
+            for (int x = x0; x <= x1; x++) {
+                if (x < 0 || x >= CH_W) continue;
+                float px = x + 0.5f - ax, py = y + 0.5f - ay;
+                float t = l2 > 0 ? clampf((px * dx + py * dy) / l2, 0, 1) : 0;
+                float ex = px - t * dx, ey = py - t * dy;
+                float cov = clampf(1.3f - sqrtf(ex * ex + ey * ey), 0, 1);
+                int a = (int)(cov * 15 + 0.5f);
+                uint8_t *mp = &CHT.mask[y * CH_W + x];
+                if (a > (*mp >> 4)) *mp = (uint8_t)((a << 4) | (*mp & 15));
+            }
+        }
+        /* track the line's y per column for the fill */
+        for (int x = (int)fminf(ax, bx); x <= (int)fmaxf(ax, bx) && x < CH_W; x++) {
+            if (x < 0) continue;
+            float t = dx != 0 ? clampf((x + 0.5f - ax) / dx, 0, 1) : 0;
+            float yy = ay + dy * t;
+            if (yy < colmin[x]) colmin[x] = yy;
+        }
+    }
+    for (int x = 0; x < CH_W; x++) {
+        if (colmin[x] > 1e8f) continue;
+        for (int y = (int)colmin[x] + 1; y < CH_H; y++) {
+            float f = 1 - (y - colmin[x]) / (CH_H - colmin[x]);
+            int a = (int)(f * f * 15);
+            uint8_t *mp = &CHT.mask[y * CH_W + x];
+            *mp = (uint8_t)((*mp & 0xF0) | a);
+        }
+    }
+    CHT.end_x = pt[n - 1].x * (CH_W - 1);
+    CHT.end_v = pt[n - 1].v;
+}
+
+static uint32_t chart_rev_now(void)
+{
+    return S.m->intra.rev * 131u + S.m->daily.rev * 7u + (uint32_t)(S.m->quote.price * 100);
+}
+
+static void draw_chart(strip_t *st, int alpha, int yoff)
+{
+    if (!CHT.ok || !CHT.mask || alpha <= 0) return;
+    uint16_t line = C_GOLD_HI, fill = rgb565(150, 110, 40);
+    int y0 = CH_Y0 + yoff;
+    int r1 = isnan(CHT.ref1) ? -999 : (int)lrintf(chart_y(CHT.ref1));
+    int r2 = isnan(CHT.ref2) ? -999 : (int)lrintf(chart_y(CHT.ref2));
+    for (int yy = 0; yy < st->h; yy++) {
+        int y = st->y0 + yy, cy = y - y0;
+        if (cy < 0 || cy >= CH_H) continue;
+        uint16_t *o = &st->px[yy * SCR_W + CH_X0];
+        const uint8_t *mr = &CHT.mask[cy * CH_W];
+        bool d1 = cy == r1, d2 = cy == r2;
+        for (int x = 0; x < CH_W; x++) {
+            uint16_t c = o[x];
+            if ((d1 || d2) && ((x >> 2) & 1) == 0) c = blend565(c, d1 ? C_GOLD : C_GOLD_DIM, (d1 ? 150 : 110) * alpha >> 8);
+            int f = mr[x] & 15, l = mr[x] >> 4;
+            if (f) c = blend565(c, fill, (f * 7 * alpha) >> 8);
+            if (l) c = blend565(c, line, (l * 17 * alpha) >> 8);
+            o[x] = c;
+        }
+    }
+    /* now: a warm point at the end of the line */
+    float ex = CH_X0 + CHT.end_x + 0.5f, ey = y0 + chart_y(CHT.end_v);
+    glow_add(st, ex, ey, 7, 255, 210, 140, 0.35f * alpha / 256);
+    fill_rrect(st, ex - 2, ey - 2, ex + 2, ey + 2, 2, rgb565(255, 244, 214), alpha);
+    /* your purchase: a tiny ingot */
+    if (CHT.mark_x >= 0) {
+        float mx = CH_X0 + CHT.mark_x * (CH_W - 1) + 0.5f, my = y0 + chart_y(CHT.mark_v);
+        fill_rrect(st, mx - 4.5f, my - 3, mx + 4.5f, my + 3, 1.5f, rgb565(0, 0, 0), alpha * 160 >> 8);
+        fill_rrect(st, mx - 3.5f, my - 2, mx + 3.5f, my + 2, 1, rgb565(236, 196, 104), alpha);
+    }
+}
+
+static void fmt_big(double v, char *out, int cap)
+{
+    if (v >= 1e12) snprintf(out, cap, "%.2fT", v / 1e12);
+    else if (v >= 1e9) snprintf(out, cap, "%.2fB", v / 1e9);
+    else if (v >= 1e6) snprintf(out, cap, "%.1fM", v / 1e6);
+    else snprintf(out, cap, "%.0f", v);
+}
+
+static void fmt_dur(int64_t s, char *out, int cap)
+{
+    if (s < 0) s = 0;
+    int h = (int)(s / 3600), mi = (int)(s / 60 % 60);
+    if (h >= 24) snprintf(out, cap, "%dD %dH", h / 24, h % 24);
+    else snprintf(out, cap, "%dH %02dM", h, mi);
+}
+
+static void row_lr(strip_t *st, int y, const char *l, const char *r, uint16_t rc, int a)
+{
+    text_draw(st, &font_caps11, l, 26, y, 1.4f, C_GOLD_DIM, a);
+    text_draw(st, &font_mono11, r, 145 - text_width(&font_mono11, r, 0), y, 0, rc, a);
+}
+
+static void render_enamel(strip_t *st)
+{
     if (S.back) render_metal(st, S.back, S.lut_back, false);
-    const float X0 = 13, X1 = 157, Y0 = 13, Y1 = 307, R = 9;
+    const float X0 = PANEL_X0, X1 = PANEL_X1, Y0 = PANEL_Y0, Y1 = PANEL_Y1, R = 9;
     for (int yy = 0; yy < st->h; yy++) {
         int y = st->y0 + yy;
         float fy = y + 0.5f;
@@ -659,7 +885,7 @@ static void render_ledger(strip_t *st)
         float vcov = clampf(fminf(fy - Y0, Y1 - fy) + 0.5f, 0, 1);
         float t = (y - Y0) / (Y1 - Y0);
         int base = (int)(14 + 8 * (1 - t));
-        if (y < Y0 + 5) base -= (int)((Y0 + 5 - y) * 2);       /* inner shadow under the top lip */
+        if (y < Y0 + 5) base -= (int)((Y0 + 5 - y) * 2);
         uint16_t ec = rgb565(base, base - 1, base + 1);
         uint16_t *o = &st->px[yy * SCR_W];
         for (int x = (int)xa; x <= (int)xb && x < SCR_W; x++) {
@@ -667,55 +893,165 @@ static void render_ledger(strip_t *st)
             o[x] = blend565(o[x], ec, (int)(cov * 256));
         }
     }
-    if (st->y0 > 300 || st->y0 + st->h < 20) return;
+}
 
+static void page_today(strip_t *st, int a, int yo)
+{
     const quote_t *q = &S.m->quote;
     const purchase_t *p = &S.m->mint.p;
     int cx = SCR_W / 2;
-    text_draw(st, &font_caps11, "ANT", 26, 38, 2.0f, C_GOLD_DIM, 256);
-    text_draw(st, &font_caps11, "NASDAQ", 145 - text_width(&font_caps11, "NASDAQ", 2.0f), 38, 2.0f, C_GOLD_DIM, 256);
+    char s1[40], s2[40];
+    int64_t now = S.m->now, nopen = 0, close_at = 0;
+    mkt_t ms = now > 0 ? market_state(now, &nopen, &close_at) : MKT_CLOSED;
+    static const char *MS[] = { "CLOSED", "PRE", "OPEN", "AFTER" };
+    text_draw(st, &font_caps11, "TODAY", 26, 36 + yo, 2.0f, C_GOLD_DIM, a);
+    {
+        const char *t = MS[ms];
+        int w = text_width(&font_caps11, t, 1.6f);
+        uint16_t c = ms == MKT_OPEN ? C_GOLD_HI : (ms == MKT_CLOSED ? rgb565(120, 112, 100) : C_GOLD);
+        text_draw(st, &font_caps11, t, 145 - w, 36 + yo, 1.6f, c, a);
+        fill_rrect(st, 145 - w - 9, 30 + yo, 145 - w - 4, 35 + yo, 2.5f, c, a);
+    }
     float t = S.ledger_anim ? clampf(S.ledger_t / 0.9f, 0, 1) : (S.ledger_ready ? 0 : 1);
     float e = ease_out_cubic(t);
-    double v[5];
-    for (int i = 0; i < 5; i++) v[i] = S.led_from[i] + (S.led_to[i] - S.led_from[i]) * e;
-    char a[32], b[32];
     if (q->valid) {
-        snprintf(a, sizeof a, "$%.2f", S.led_from[0]);
-        snprintf(b, sizeof b, "$%.2f", S.led_to[0]);
-        odometer(st, &font_mono32, a, b, cx, 82, t, S.led_to[0] >= S.led_from[0], C_GOLD_HI);
-        snprintf(a, sizeof a, "%+.2f%%  TODAY", v[1]);
-        text_draw_centered(st, &font_mono11, a, cx, 101, 0, v[1] >= 0 ? C_UP : C_DOWN, 256);
+        if (a >= 250) {
+            snprintf(s1, sizeof s1, "$%.2f", S.led_from[0]);
+            snprintf(s2, sizeof s2, "$%.2f", S.led_to[0]);
+            odometer(st, &font_mono32, s1, s2, cx, 80 + yo, t, S.led_to[0] >= S.led_from[0], C_GOLD_HI);
+        } else {
+            snprintf(s2, sizeof s2, "$%.2f", q->price);
+            text_draw_centered(st, &font_mono32, s2, cx, 80 + yo, 0, C_GOLD_HI, a);
+        }
+        double chg = S.led_from[1] + (S.led_to[1] - S.led_from[1]) * e;
+        snprintf(s1, sizeof s1, "%+.2f%%   %+.2f", chg, q->price - q->prev_close);
+        text_draw_centered(st, &font_mono11, s1, cx, 99 + yo, 0, chg >= 0 ? C_UP : C_DOWN, a);
     } else {
-        text_draw_centered(st, &font_mono32, "$--.--", cx, 82, 0, C_GOLD_DIM, 256);
-        text_draw_centered(st, &font_mono11, "waiting for market data", cx, 101, 0, C_GOLD_DIM, 256);
+        text_draw_centered(st, &font_mono32, "$--.--", cx, 80 + yo, 0, C_GOLD_DIM, a);
     }
-    hairline(st, 116);
-    snprintf(a, sizeof a, "$%.2f", p->price * (p->shares > 0 ? p->shares : 1));
-    ledger_row(st, 140, "COST", a, C_GOLD);
+    if (CHT.ok) draw_chart(st, a, yo);
+    else text_draw_centered(st, &font_mono11, "no session yet", cx, CH_Y0 + CH_H / 2 + yo, 0, C_GOLD_DIM, a);
+    if (q->valid && q->high > q->low) {
+        /* day range */
+        int y = 214 + yo;
+        float u = clampf((float)((q->price - q->low) / (q->high - q->low)), 0, 1);
+        fill_rrect(st, 26, y - 1, 145, y + 1, 1, rgb565(70, 60, 44), a);
+        float cpos = 26 + u * 119;
+        fill_rrect(st, 26, y - 1, cpos, y + 1, 1, C_GOLD_DIM, a);
+        fill_rrect(st, cpos - 2.5f, y - 4, cpos + 2.5f, y + 4, 1.5f, C_GOLD_HI, a);
+        float cu = (float)((p->price - q->low) / (q->high - q->low));
+        if (cu >= 0 && cu <= 1) fill_rrect(st, 26 + cu * 119 - 0.6f, y - 5, 26 + cu * 119 + 0.6f, y + 5, 0, C_GOLD, a);
+        snprintf(s1, sizeof s1, "L %.2f", q->low);
+        snprintf(s2, sizeof s2, "H %.2f", q->high);
+        text_draw(st, &font_mono11, s1, 26, y + 15, 0, C_GOLD_DIM, a);
+        text_draw(st, &font_mono11, s2, 145 - text_width(&font_mono11, s2, 0), y + 15, 0, C_GOLD_DIM, a);
+        fmt_big(q->volume, s2, sizeof s2);
+        row_lr(st, 250 + yo, "VOLUME", s2, C_GOLD, a);
+        snprintf(s2, sizeof s2, "%.2f", q->prev_close);
+        row_lr(st, 265 + yo, "PREV", s2, C_GOLD, a);
+    }
+    if ((ms == MKT_PRE || ms == MKT_AFTER) && q->ext_price > 0) {
+        snprintf(s1, sizeof s1, "%s $%.2f %+.2f%%", ms == MKT_PRE ? "PRE" : "AFTER", q->ext_price, q->ext_pct);
+        text_draw_centered(st, &font_mono11, s1, cx, 281 + yo, 0, q->ext_pct >= 0 ? C_UP : C_DOWN, a);
+    } else if (now > 0) {
+        if (ms == MKT_OPEN) { fmt_dur(close_at - now, s2, sizeof s2); snprintf(s1, sizeof s1, "CLOSES IN %s", s2); }
+        else { fmt_dur(nopen - now, s2, sizeof s2); snprintf(s1, sizeof s1, "OPENS IN %s", s2); }
+        text_draw_centered(st, &font_caps11, s1, cx, 281 + yo, 1.2f, rgb565(130, 114, 88), a);
+    }
+}
+
+static void page_held(strip_t *st, int a, int yo)
+{
+    const quote_t *q = &S.m->quote;
+    const purchase_t *p = &S.m->mint.p;
+    int cx = SCR_W / 2;
+    char s1[40], s2[40];
+    text_draw_centered(st, &font_caps11, "SINCE YOU BOUGHT", cx, 36 + yo, 0.4f, C_GOLD_DIM, a);
     if (q->valid) {
-        snprintf(a, sizeof a, "$%.2f", v[2]);
-        ledger_row(st, 162, "VALUE", a, C_GOLD);
-        snprintf(a, sizeof a, "%+.2f%%", v[3]);
-        ledger_row(st, 184, "GAIN", a, v[3] >= 0 ? C_UP : C_DOWN);
-        snprintf(a, sizeof a, "x%.2f", v[4]);
-        ledger_row(st, 206, "VS IPO", a, C_GOLD);
-    } else {
-        ledger_row(st, 162, "VALUE", "--", C_GOLD_DIM);
-        ledger_row(st, 184, "GAIN", "--", C_GOLD_DIM);
-        ledger_row(st, 206, "VS IPO", "--", C_GOLD_DIM);
+        double g = (q->price / p->price - 1) * 100;
+        snprintf(s1, sizeof s1, "%+.2f%%", g);
+        text_draw_centered(st, &font_mono32, s1, cx, 80 + yo, 0, g >= 0 ? C_UP : C_DOWN, a);
+        snprintf(s1, sizeof s1, "$%.2f  >  $%.2f", p->price, q->price);
+        text_draw_centered(st, &font_mono11, s1, cx, 99 + yo, 0, C_GOLD_DIM, a);
     }
-    hairline(st, 222);
+    if (CHT.ok) draw_chart(st, a, yo);
     int d = days_held(S.m);
-    if (d > 0) snprintf(a, sizeof a, "%d", d); else snprintf(a, sizeof a, "--");
-    ledger_row(st, 242, "DAYS HELD", a, C_GOLD);
+    snprintf(s2, sizeof s2, d > 0 ? "%d" : "--", d);
+    row_lr(st, 222 + yo, "DAYS HELD", s2, C_GOLD, a);
+    /* best and worst close while held, from the chart's own points */
+    if (CHT.ok && CHT.page == 1) {
+        static cpt_t pt[INTRA_MAX + 2];
+        float r1, r2, mx, mv;
+        int n = chart_points(1, pt, INTRA_MAX + 2, &r1, &r2, &mx, &mv);
+        float hi = -1e9f, lo = 1e9f;
+        for (int i = 0; i < n; i++) { hi = fmaxf(hi, pt[i].v); lo = fminf(lo, pt[i].v); }
+        snprintf(s2, sizeof s2, "%.2f", hi);
+        row_lr(st, 240 + yo, "HIGHEST", s2, C_GOLD, a);
+        snprintf(s2, sizeof s2, "%.2f", lo);
+        row_lr(st, 258 + yo, "LOWEST", s2, C_GOLD, a);
+    }
+    if (q->valid) {
+        int sh = p->shares > 0 ? p->shares : 1;
+        snprintf(s2, sizeof s2, "%+.2f", (q->price - p->price) * sh);
+        row_lr(st, 276 + yo, "P / L  $", s2, q->price >= p->price ? C_UP : C_DOWN, a);
+    }
+}
+
+static void page_ipo(strip_t *st, int a, int yo)
+{
+    const quote_t *q = &S.m->quote;
+    const purchase_t *p = &S.m->mint.p;
+    int cx = SCR_W / 2;
+    char s1[40], s2[40];
+    text_draw_centered(st, &font_caps11, "SINCE IPO", cx, 36 + yo, 2.0f, C_GOLD_DIM, a);
+    if (q->valid) {
+        snprintf(s1, sizeof s1, "x%.2f", q->price / IPO_PRICE);
+        text_draw_centered(st, &font_mono32, s1, cx, 80 + yo, 0, q->price >= IPO_PRICE ? C_UP : C_DOWN, a);
+    }
+    text_draw_centered(st, &font_mono11, "IPO $83.00  NOV 19", cx, 99 + yo, 0, C_GOLD_DIM, a);
+    if (CHT.ok) draw_chart(st, a, yo);
     double total = (q->valid && q->total_shares > 1e6) ? q->total_shares : DEFAULT_TOTAL_SHARES;
-    fmt_pct_tiny(100.0 * (p->shares > 0 ? p->shares : 1) / total, a, sizeof a);
-    text_draw_centered(st, &font_caps11, "YOU OWN", cx, 264, 1.4f, C_GOLD_DIM, 256);
-    text_draw_centered(st, &font_mono11, a, cx, 279, 0, C_GOLD, 256);
-    if (q->valid && strlen(q->when) >= 16) {
-        int mo = atoi(q->when + 5), dd = atoi(q->when + 8);
-        snprintf(a, sizeof a, "%s %d  %.5s ET", MONS[(mo >= 1 && mo <= 12) ? mo - 1 : 0], dd, q->when + 11);
-        text_draw_centered(st, &font_mono11, a, cx, 299, 0, rgb565(120, 104, 80), 256);
+    if (q->valid) {
+        fmt_big(total * q->price, s2, sizeof s2);
+        char s3[24];
+        snprintf(s3, sizeof s3, "$%s", s2);
+        row_lr(st, 222 + yo, "MKT CAP", s3, C_GOLD, a);
+    }
+    snprintf(s2, sizeof s2, "%.2f", p->price);
+    row_lr(st, 240 + yo, "ENTRY", s2, C_GOLD, a);
+    fmt_pct_tiny(100.0 * (p->shares > 0 ? p->shares : 1) / total, s1, sizeof s1);
+    text_draw_centered(st, &font_caps11, "YOU OWN", cx, 262 + yo, 1.4f, C_GOLD_DIM, a);
+    text_draw_centered(st, &font_mono11, s1, cx, 277 + yo, 0, C_GOLD, a);
+}
+
+static void render_ledger(strip_t *st)
+{
+    render_enamel(st);
+    if (st->y0 > PANEL_Y1 || st->y0 + st->h < PANEL_Y0) return;
+    /* page crossfade: out (0..0.12s), switch, in (0.12..0.30s) */
+    int a = 256, yo = 0;
+    if (S.mfading) {
+        float t = S.mfade_t;
+        if (t < 0.12f) a = (int)(256 * (1 - t / 0.12f));
+        else { float u = clampf((t - 0.12f) / 0.18f, 0, 1); a = (int)(256 * ease_out_cubic(u)); yo = (int)lrintf(6 * (1 - ease_out_cubic(u))); }
+    }
+    int pg = S.mpage;
+    if (pg == 0) page_today(st, a, yo);
+    else if (pg == 1) page_held(st, a, yo);
+    else page_ipo(st, a, yo);
+    /* page dots */
+    for (int i = 0; i < 3; i++) {
+        float x = SCR_W / 2.0f + (i - 1) * 10;
+        fill_rrect(st, x - 2, 296, x + 2, 300, 2, i == S.mpage ? C_GOLD_HI : rgb565(70, 60, 44), 256);
+    }
+    /* a big day gets a small mark, nothing louder */
+    const quote_t *q = &S.m->quote;
+    if (q->valid && fabs(q->chg_pct) >= 5) {
+        uint16_t c = q->chg_pct >= 0 ? C_UP : C_DOWN;
+        draw_seg(st, 149, 18, 152, 21, 1.6f, c, 256);
+        draw_seg(st, 152, 21, 149, 24, 1.6f, c, 256);
+        draw_seg(st, 149, 24, 146, 21, 1.6f, c, 256);
+        draw_seg(st, 146, 21, 149, 18, 1.6f, c, 256);
     }
 }
 
@@ -1079,7 +1415,7 @@ static void start_flip(void)
     S.flip_t = 0;
     S.fth = 0;
     S.fvel = 2.5f;          /* the shake gives it a small kick */
-    if (S.face_to == F_LEDGER) ledger_prepare();
+    if (S.face_to == F_LEDGER) { ledger_prepare(); build_chart(S.mpage); }
     S.glint_on = false;
 }
 
@@ -1238,7 +1574,17 @@ void scene_tick(float dt, const input_t *in)
             int d = days_held(m);
             if (d != S.line_for_day || strcmp(S.line, current_line(d))) { build_back(false); S.burin = true; }
         }
-        if (S.face == F_LEDGER) {
+        if (S.face == F_LEDGER && !S.flipping) {
+            if (tap && !S.mfading) { S.mfading = true; S.mfade_t = 0; S.mpage_to = (S.mpage + 1) % 3; }
+            if (S.mfading) {
+                float before = S.mfade_t;
+                S.mfade_t += dt;
+                if (before < 0.12f && S.mfade_t >= 0.12f) { S.mpage = S.mpage_to; build_chart(S.mpage); }
+                if (S.mfade_t >= 0.30f) S.mfading = false;
+            }
+            if (!S.mfading && (CHT.page != S.mpage || CHT.rev != chart_rev_now())) { build_chart(S.mpage); S.dirty = true; }
+            int minute = (int)(m->now / 60);
+            if (minute != S.last_minute) { S.last_minute = minute; S.dirty = true; }
             if (S.ledger_anim) { S.ledger_t += dt; if (S.ledger_t > 1.2f) S.ledger_anim = false; }
             if (!S.ledger_anim && m->quote.valid && (!S.have_shown || fabs(m->quote.price - S.shown_price) > 0.004)) { ledger_prepare(); land_on(F_LEDGER); }
         }
@@ -1332,6 +1678,12 @@ void scene_led(uint8_t *r, uint8_t *g, uint8_t *b)
         float f = 0.08f + 0.06f * sinf(S.clock * 53) * sinf(S.clock * 31);
         R = f; G = f * 0.75f; B = f * 0.45f;
     }
+    if (S.st == ST_FACES && !(S.burin && S.face == F_LINE) && S.m->quote.valid && S.m->now > 0 &&
+        market_state(S.m->now, NULL, NULL) == MKT_OPEN) {
+        float br = 0.035f + 0.02f * sinf(S.clock * 1.6f);
+        if (S.m->quote.price >= S.m->mint.p.price) { R += br; G += br * 0.68f; B += br * 0.22f; }
+        else { R += br * 0.4f; G += br * 0.5f; B += br * 0.75f; }
+    }
     if (S.m->settings_mode) {
         float br = 0.04f + 0.03f * sinf(S.clock * 2);
         G += br * 0.7f; B += br;
@@ -1351,7 +1703,7 @@ uint32_t scene_take_events(void)
 bool scene_animating(void)
 {
     if (S.dirty) { S.dirty = false; return true; }
-    if (S.fade < 1 || S.st != ST_FACES || S.flipping || S.glint_on || S.burin || S.ledger_anim ||
+    if (S.fade < 1 || S.st != ST_FACES || S.flipping || S.glint_on || S.burin || S.ledger_anim || S.mfading ||
         S.sweeping || S.pressed || S.ring_fade > 0 || S.m->settings_mode)
         return true;
     return false;

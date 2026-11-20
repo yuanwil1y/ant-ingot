@@ -33,7 +33,12 @@ void ingot_gen_base(uint8_t *buf, uint32_t seed, int back);
 /* Engrave the front (rosette + inscriptions) on top of base. buf receives the result. */
 void ingot_gen_front(uint8_t *buf, const uint8_t *base, const mint_rec_t *m, ingot_layout_t *lay);
 
-void ingot_front_layout(ingot_layout_t *lay);
+void ingot_front_layout(ingot_layout_t *lay, bool inscription);
+
+/* US/Eastern UTC offset (seconds) and the regular/extended session at a UTC instant */
+int us_et_offset(int64_t utc);
+typedef enum { MKT_CLOSED = 0, MKT_PRE, MKT_OPEN, MKT_AFTER } mkt_t;
+mkt_t market_state(int64_t utc, int64_t *next_open, int64_t *close_at);
 
 /* Engrave one string straight into a finished face (used for the daily line, char by char). */
 void ingot_engrave_text(uint8_t *buf, const font_t *f, const char *s, float x, int baseline,

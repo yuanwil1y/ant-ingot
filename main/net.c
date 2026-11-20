@@ -18,6 +18,7 @@
 #include "esp_timer.h"
 #include "cJSON.h"
 #include "dns_server.h"
+#include "ingot.h"
 
 static const char *TAG = "net";
 
@@ -172,11 +173,176 @@ static bool fetch_quote(void)
     M->quote.price = price;
     M->quote.prev_close = atof(f[4]);
     M->quote.chg_pct = atof(f[32]);
+    M->quote.open = atof(f[5]);
+    M->quote.volume = atof(f[6]);
     M->quote.high = atof(f[33]);
     M->quote.low = atof(f[34]);
     if (n > 62 && atof(f[62]) > 1e6) M->quote.total_shares = atof(f[62]);
     snprintf(M->quote.when, sizeof M->quote.when, "%s", f[30]);
     M->quote.fetched_ts = time(NULL);
+    UNLOCK();
+    return true;
+}
+
+static int64_t days_from_civil_net(int y, int m, int d)
+{
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+/* ---------------------------------------------------------------- streaming market history
+ * The minute and k-line payloads are tens of KB; instead of buffering them we read the
+ * quoted strings as they stream past and keep only the numbers we need. */
+
+typedef struct tok_s {
+    char buf[48];
+    int len;
+    bool in;
+    void (*on)(struct tok_s *t, const char *s, int n);
+    char prev[16];
+    int state;
+    int date;
+    int n;
+    int32_t day[SERIES_MAX];
+    float close[SERIES_MAX];
+    int16_t min[INTRA_MAX];
+    float px[INTRA_MAX];
+} tok_t;
+
+static esp_err_t on_tok(esp_http_client_event_t *e)
+{
+    tok_t *t = e->user_data;
+    if (e->event_id != HTTP_EVENT_ON_DATA || !t) return ESP_OK;
+    const char *d = e->data;
+    for (int i = 0; i < e->data_len; i++) {
+        char c = d[i];
+        if (!t->in) { if (c == '"') { t->in = true; t->len = 0; } continue; }
+        if (c == '"') {
+            t->buf[t->len] = 0;
+            t->on(t, t->buf, t->len);
+            snprintf(t->prev, sizeof t->prev, "%.15s", t->buf);
+            t->in = false;
+        } else if (t->len < (int)sizeof t->buf - 1) {
+            t->buf[t->len++] = c;
+        }
+    }
+    return ESP_OK;
+}
+
+/* "1307 84.78 280653244" → minute + price; "date" key → session date */
+static void on_minute(tok_t *t, const char *s, int n)
+{
+    if (!strcmp(t->prev, "date") && n == 8) { t->date = atoi(s); return; }
+    if (n < 8 || s[4] != ' ' || !isdigit((unsigned char)s[0])) return;
+    int hhmm = atoi(s);
+    float px = atof(s + 5);
+    int m = (hhmm / 100) * 60 + hhmm % 100 - 570;
+    if (px > 0 && m >= 0 && m <= 390 && t->n < INTRA_MAX) { t->min[t->n] = (int16_t)m; t->px[t->n] = px; t->n++; }
+}
+
+/* ["2026-11-19","111.50","97.17",...] → day + close */
+static void on_kline(tok_t *t, const char *s, int n)
+{
+    if (n == 10 && s[4] == '-' && s[7] == '-' && isdigit((unsigned char)s[0])) {
+        int Y = atoi(s), Mo = atoi(s + 5), D = atoi(s + 8);
+        if (t->n < SERIES_MAX) t->day[t->n] = (int32_t)days_from_civil_net(Y, Mo, D);
+        t->state = 1;
+        return;
+    }
+    if (t->state == 1) { t->state = 2; return; }                 /* open */
+    if (t->state == 2) {                                        /* close */
+        float c = atof(s);
+        if (c > 0 && t->n < SERIES_MAX) t->close[t->n++] = c;
+        t->state = 0;
+    }
+}
+
+static bool fetch_stream(const char *url, tok_t *t)
+{
+    esp_http_client_config_t cfg = {
+        .url = url, .event_handler = on_tok, .user_data = t, .timeout_ms = 12000,
+        .crt_bundle_attach = esp_crt_bundle_attach, .buffer_size = 1024,
+    };
+    esp_http_client_handle_t h = esp_http_client_init(&cfg);
+    esp_err_t e = esp_http_client_perform(h);
+    int st = esp_http_client_get_status_code(h);
+    esp_http_client_cleanup(h);
+    if (e != ESP_OK || st != 200) { ESP_LOGW(TAG, "%s: %d %s", url, st, esp_err_to_name(e)); return false; }
+    return true;
+}
+
+static bool fetch_intraday(void)
+{
+    tok_t *t = calloc(1, sizeof *t);
+    if (!t) return false;
+    t->on = on_minute;
+    bool ok = fetch_stream("https://web.ifzq.gtimg.cn/appstock/app/UsMinute/query?code=usANT.OQ", t) && t->n > 0;
+    if (ok) {
+        LOCK();
+        M->intra.n = t->n;
+        M->intra.date = t->date;
+        memcpy(M->intra.min, t->min, t->n * sizeof t->min[0]);
+        memcpy(M->intra.px, t->px, t->n * sizeof t->px[0]);
+        M->intra.rev++;
+        UNLOCK();
+    }
+    free(t);
+    return ok;
+}
+
+static bool fetch_history(void)
+{
+    tok_t *t = calloc(1, sizeof *t);
+    if (!t) return false;
+    t->on = on_kline;
+    char url[160];
+    snprintf(url, sizeof url, "https://web.ifzq.gtimg.cn/appstock/app/usfqkline/get?param=usANT.OQ,day,,,%d,qfq", SERIES_MAX);
+    bool ok = fetch_stream(url, t) && t->n > 0;
+    if (ok && t->n >= SERIES_MAX) {             /* more than ~14 months: weekly closes cover it */
+        memset(t, 0, sizeof *t);
+        t->on = on_kline;
+        snprintf(url, sizeof url, "https://web.ifzq.gtimg.cn/appstock/app/usfqkline/get?param=usANT.OQ,week,,,%d,qfq", SERIES_MAX);
+        ok = fetch_stream(url, t) && t->n > 0;
+    }
+    if (ok) {
+        LOCK();
+        M->daily.n = t->n;
+        memcpy(M->daily.day, t->day, t->n * sizeof t->day[0]);
+        memcpy(M->daily.close, t->close, t->n * sizeof t->close[0]);
+        M->daily.rev++;
+        UNLOCK();
+    }
+    free(t);
+    return ok;
+}
+
+/* Sina carries the pre-market / after-hours price (fields 21, 22) */
+static bool fetch_extended(void)
+{
+    char buf[700] = { 0 };
+    body_t b = { buf, 0, sizeof buf };
+    esp_http_client_config_t cfg = { .url = "http://hq.sinajs.cn/list=gb_ant", .event_handler = on_http, .user_data = &b, .timeout_ms = 8000 };
+    esp_http_client_handle_t h = esp_http_client_init(&cfg);
+    esp_http_client_set_header(h, "Referer", "https://finance.sina.com.cn");
+    esp_err_t e = esp_http_client_perform(h);
+    int st = esp_http_client_get_status_code(h);
+    esp_http_client_cleanup(h);
+    if (e != ESP_OK || st != 200) return false;
+    char *q = strchr(buf, '"');
+    if (!q) return false;
+    char *f[40] = { 0 };
+    int n = 0;
+    f[n++] = ++q;
+    for (char *p = q; *p && *p != '"' && n < 40; p++)
+        if (*p == ',') { *p = 0; f[n++] = p + 1; }
+    if (n < 23) return false;
+    LOCK();
+    M->quote.ext_price = atof(f[21]);
+    M->quote.ext_pct = atof(f[22]);
     UNLOCK();
     return true;
 }
@@ -519,7 +685,7 @@ static esp_err_t h_setup(httpd_req_t *r)
         const char *ins = jstr(j, "inscription");
         if (ins) {
             int o = 0;
-            for (const char *q = ins; *q && o < 24; q++)
+            for (const char *q = ins; *q && o < 18; q++)
                 if (*q >= 32 && *q <= 126) p.inscription[o++] = (char)toupper((unsigned char)*q);
             p.inscription[o] = 0;
         }
@@ -684,7 +850,8 @@ void net_on_minted(void) { xTaskCreate(minted_off_task, "apoff", 2048, NULL, 2, 
 
 static void worker(void *arg)
 {
-    int64_t last_quote = -1000, last_ds = -100000;
+    int64_t last_quote = -100000, last_intra = -100000, last_hist = -100000, last_ext = -100000, last_ds = -100000;
+    mkt_t prev_state = MKT_CLOSED;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(2000));
         int64_t now_s = esp_timer_get_time() / 1000000;
@@ -697,13 +864,23 @@ static void worker(void *arg)
         if (net_time_valid()) M->now = time(NULL);
         int day = days_held(M);
         bool need_line = minted && day > 0 && M->line_day != day;
+        int64_t now = M->now;
         UNLOCK();
         if (!minted || s_checking) continue;
         if (!(xEventGroupGetBits(s_ev) & EV_CONNECTED)) continue;
-        if (now_s - last_quote >= 120) {
-            last_quote = now_s;
-            fetch_quote();
+        /* refresh cadence follows the market: open 15 s, pre/after 1 min, closed 10 min */
+        mkt_t ms = now > 0 ? market_state(now, NULL, NULL) : MKT_CLOSED;
+        int q_every = ms == MKT_OPEN ? 15 : (ms == MKT_CLOSED ? 600 : 60);
+        int i_every = ms == MKT_OPEN ? 60 : 900;
+        if (ms != prev_state) {                 /* a session boundary: refresh everything once */
+            last_quote = last_intra = last_ext = -100000;
+            if (prev_state == MKT_OPEN) last_hist = -100000;
+            prev_state = ms;
         }
+        if (now_s - last_quote >= q_every) { last_quote = now_s; fetch_quote(); }
+        if ((ms == MKT_PRE || ms == MKT_AFTER) && now_s - last_ext >= 60) { last_ext = now_s; fetch_extended(); }
+        if (now_s - last_intra >= i_every) { if (fetch_intraday()) last_intra = now_s; else last_intra = now_s - i_every + 60; }
+        if (now_s - last_hist >= 6 * 3600) { if (fetch_history()) last_hist = now_s; else last_hist = now_s - 6 * 3600 + 120; }
         if (need_line && C.ds_key[0] && now_s - last_ds >= 600) {
             last_ds = now_s;
             char line[160] = { 0 };
